@@ -1,172 +1,202 @@
 from frame import *
 import socket
-import libcache2 as libcache
-import select
+import traceback
+import pathlib
+import configparser, argparse
+import hmac, hashlib
 
-class RecursiveDNSResolver:
-    def __init__(self) -> None:
-        self._packet = DNSPacket(DNSHeader(0, DNSHeader_Flags(False, 0, False, False, True, False, False, False, 0)))
-        self.cache = libcache.Cache()
-    def _ask_map(self, map: dict, data: bytes):
-        socks = []
-        for (name, ips) in map.items():
-            for ip in ips:
-                if not ip: continue
-                try:
-                    sock = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_DGRAM)
-                    sock.setblocking(False)
-                    sock.sendto(data, (ip, 53))
-                    socks.append(sock)
-                except OSError: pass
+BUFFER_SIZE = 4096
+EDNS_SECRET = b"flerken"
 
-        if not socks: raise ConnectionError(f"Could not connect to any server in {map}")
+parser = argparse.ArgumentParser()
+parser.add_argument("config", type=str, default="config.ini")
+args = parser.parse_args()
 
-        try:
-            readable, _, _ = select.select(socks, [], [], 5.0)
-            if not readable: raise ConnectionError("All servers timed out")
-            response, _ = readable[0].recvfrom(512)
-            return response
-        finally:
-            for s in socks: s.close()
-    def get_ip_from_cache(self, domain: str):
-        entries = []
-        while True:
-            if self.cache.doesElementExist(f"ip:{domain}:{len(entries)}"):
-                entries.append(self.cache.getElement(f"ip:{domain}:{len(entries)}"))
-            else: break
-        return entries
-    def get_ns_from_cache(self, domain: str):
-        entries = []
-        while True:
-            if self.cache.doesElementExist(f"ns:{domain}:{len(entries)}"):
-                entries.append(self.cache.getElement(f"ns:{domain}:{len(entries)}"))
-            else: break
-        out_ns_map = {}
-        for ns in entries:
-            ips = self.get_ip_from_cache(ns)
-            out_ns_map[ns] = ips
-        return out_ns_map
-    def resolve(self, domain: str, resolving: set | None = None):
-        if resolving is None: resolving = set()
-        if domain in resolving: return []  # cycle detected, give up on this branch
-        resolving = resolving | {domain}  # don't mutate the caller's set
+config = configparser.ConfigParser()
+config.read(args.config)
 
-        def fetch_ns(d: str, servers: dict):
-            self._packet.clear()
-            self._packet.add_question(DNSQuestion(d, DNSType.A, DNSClass.IN))
-            print("fetch servers", servers)
-            parsed = DNSPacket.from_bytes(self._ask_map(servers, bytes(self._packet)))
+RECORDS_FILE = pathlib.Path(config["records"]["file"]).resolve()
+ZONE = config["soa"]["zone"].rstrip(".") + "."
 
-            ns_names = []
-            for i, authority in enumerate(parsed.authority):
-                if DNSType(authority.type) != DNSType.NS: continue
-                ns_names.append(authority.rdata_decoded)
-                print("Saving authority", d, i, authority.rdata_decoded)
-                self.cache.saveElement(f"ns:{d}:{i}", authority.rdata_decoded, authority.ttl, deleteifexists=True)
-                self.cache.deleteElementIfExists(f"ns:{d}:{i+1}")
+HOST = "0.0.0.0"
+PORT = 53
 
-            ns_map = {}
-            for additional in parsed.additional:
-                if additional.name in ns_names:
-                    orig_v4, orig_v6 = ns_map.get(additional.name, ([], []))
-                    if DNSType(additional.type) == DNSType.A: orig_v4.append((additional.rdata_decoded, additional.ttl))
-                    elif DNSType(additional.type) == DNSType.AAAA: orig_v6.append((additional.rdata_decoded, additional.ttl))
-                    ns_map[additional.name] = (orig_v4, orig_v6)
+records_cache = None
+records_mtime = None
 
-            for (ns, (ipv4, ipv6)) in ns_map.items():
-                i = 0
-                for (ip, ttl) in ipv4 + ipv6:
-                    print("Saving", ns, i, ip)
-                    self.cache.saveElement(f"ip:{ns}:{i}", ip, ttl, deleteifexists=True)
-                    i += 1
-            
-            out_ns_map = {}
-            for ns in ns_names:
-                ips = self.get_ip_from_cache(ns)
-                if not ips:
-                    try: 
-                        ips = [i[0] for i in self.resolve(ns, resolving)]
-                    except (ConnectionError, RecursionError): pass
-                out_ns_map[ns] = ips
-            return out_ns_map, parsed
-        servers = self.get_ns_from_cache(domain) or ROOT_SERVERS
-        print("servers", servers)
-        print("resolving", domain)
-        while True:
-            servers, parsed = fetch_ns(domain, servers)
-            if parsed.answers:
-                results = []
-                for i, answer in enumerate(parsed.answers):
-                    if DNSType(answer.type) in (DNSType.A, DNSType.AAAA):
-                        results.append((answer.rdata_decoded, answer.ttl))
-                        self.cache.saveElement(f"ip:{domain}:{i}", answer.rdata_decoded, answer.ttl, deleteifexists=True)
-                    elif DNSType(answer.type) == DNSType.CNAME: 
-                        results.extend(self.resolve(answer.rdata_decoded, resolving))
-                if results:
-                    return results
-# import os, traceback
-# while True:
-#     d = input(">")
-#     if d.startswith(">"):
-#         print(dns.get_ip_from_cache(d[1:]))
-#         continue
-#     elif d.startswith("!"):
-#         print(dns.get_ns_from_cache(d[1:]))
-#         continue
-#     # os.system("cls")
-#     try: print(dns.resolve(d))
-#     except Exception as e:
-#         traceback.print_exception(e)
-if __name__ == "__main__":    
-    import traceback, time
-    dns = RecursiveDNSResolver()
+def load_records():
+    """
+    Load records from a tab-separated file.
+    Format (one record per line):
+        type  name  ttl  value
+    Name rules:
+        @        → zone apex
+        www      → relative, zone appended  (www.example.com.)
+        foo.org. → trailing dot = FQDN, used as-is
+    Lines starting with # are ignored.
+    """
+    global records_cache, records_mtime
 
-    HOST = "0.0.0.0"
-    PORT = 53
-    BUFFER_SIZE = 512
+    mtime = RECORDS_FILE.stat().st_mtime
+    if records_mtime == mtime:
+        return records_cache
 
-    out_cache = libcache.Cache()
+    records = {}  # (qname, qtype) -> (ttl, [values])
 
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.bind((HOST, PORT))
-        s.setblocking(False)
-        print(f"UDP server listening on {HOST}:{PORT}")
+    with open(RECORDS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t", 3)
+            if len(parts) != 4:
+                print(f"[warn] skipping malformed record line: {line!r}")
+                continue
+            rtype, name, ttl, value = parts
 
-        while True:
+            if name == "@":
+                name = ZONE
+            elif not name.endswith("."):
+                name = name + "." + ZONE
+            # else already a FQDN
+
             try:
-                data, addr = s.recvfrom(BUFFER_SIZE)
-                parsed = DNSPacket.from_bytes(data)
-                out = DNSPacket(DNSHeader(parsed.header.transaction_id, DNSHeader_Flags(True, 0, False, False, False, False, False, False, 0)))
-                if parsed.header.flags.qr: continue
-                if parsed.header.flags.opcode != 0:
-                    print("Unhandled opcode:", parsed.header.flags.opcode)
+                qtype = DNSType[rtype.upper()]
+                ttl = int(ttl)
+            except (KeyError, ValueError) as e:
+                print(f"[warn] skipping record ({e}): {line!r}")
+                continue
+
+            key = (name, qtype)
+            if key not in records:
+                records[key] = (ttl, [])
+            records[key][1].append(value)
+
+    records_cache = records
+    records_mtime = mtime
+    print(f"[info] loaded {len(records)} record sets from {RECORDS_FILE}")
+    return records
+
+def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
+    """
+    Look up (qname, qtype) in the flat records table.
+    Falls back to a wildcard entry keyed as (*.<parent>, qtype).
+    Returns (ttl, values), name_exists.
+    """
+    records = load_records()
+    qname = qname.rstrip(".") + "."  # normalise
+
+    result = records.get((qname, qtype))
+    if result:
+        print(result)
+        if result[1][0] == "!":
+            return (1, [socket.inet_ntoa(client_ip)]), True
+        return result, True
+
+    # wildcard fallback
+    labels = qname.rstrip(".").split(".")
+    if len(labels) > 1:
+        wildcard = "*." + ".".join(labels[1:]) + "."
+        result = records.get((wildcard, qtype))
+        if result:
+            return result, True
+
+    name_exists = any(k[0] == qname for k in records)
+    return None, name_exists
+
+
+def handle(packet: DNSPacket, client_ip: bytes):
+    out = DNSPacket(DNSHeader(
+        packet.header.transaction_id,
+        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, False, False, False, False, DNSRCode.NOERROR)
+    ))
+    if packet.header.flags.qr: return
+    if packet.header.flags.opcode != DNSOPCode.QUERY:
+        print("Unhandled opcode:", packet.header.flags.opcode)
+        return
+
+    zone = config["soa"]["zone"]
+    primary_ns = config["soa"]["primary_ns"]
+
+    def soa():
+        if config.has_section("soa"):
+            email = config["soa"]["email"].replace("@", ".")
+            refresh = config.getint("soa", "refresh", fallback=3600)
+            retry = config.getint("soa", "retry", fallback=1800)
+            expire = config.getint("soa", "expire", fallback=1209600)
+            minimum = config.getint("soa", "min", fallback=86400)
+            serial = config.get("soa", "serial", fallback="0")
+            ttl = config.getint("soa", "ttl", fallback=300)
+            out.add_answer(DNSAnswer(
+                zone, DNSType.SOA, DNSClass.IN, ttl,
+                rdata_decoded=(
+                    f"{primary_ns}. {email}. serial={serial} "
+                    f"refresh={refresh} retry={retry} "
+                    f"expire={expire} min={minimum}"
+                )
+            ))
+
+    for question in packet.questions:
+        out.add_question(question)
+        print(question)
+
+        match question.qtype:
+            case DNSType.SOA:
+                soa()
+            case _:
+                if question.qtype == DNSType.NS and question.qname == zone:
+                    out.add_answer(DNSAnswer(
+                        zone, DNSType.NS, DNSClass.IN, 300,
+                        rdata_decoded=primary_ns
+                    ))
                     continue
-                for question in parsed.questions:
-                    out.add_question(question)
-                    print(question)
-                    if DNSClass(question.qclass) != DNSClass.IN or DNSType(question.qtype) != DNSType.A: continue
 
-                    if (count := out_cache.getElement(question.qname, False)):
-                        count = int(count)
-                        if count > 0:
-                            for i in range(count):
-                                b: DNSAnswer = out_cache.getElement(f"{question.qname}:{i}", aggressive=False)
-                                ttl = out_cache.getRemainingTTL(f"{question.qname}:{i}")
-                                if not b: continue
-                                if ttl is not None: b.ttl = int(ttl)
-                                print(b, ttl)
-                                out.add_answer(b)
-                            continue
-                    else: print("cache miss")
+                result, exists = resolve_records(question.qname, question.qtype, client_ip)
 
-                    max_ttl = 0
-                    for i,(a,ttl) in enumerate(dns.resolve(question.qname)):
-                        if max_ttl < ttl: max_ttl = ttl
-                        aw = DNSAnswer(question.qname, DNSType.A, DNSClass.IN, ttl, socket.inet_aton(a))
-                        out.add_answer(aw)
-                        out_cache.saveElement(f"{question.qname}:{i}", aw, ttl)
-                        out_cache.saveElement(question.qname, i+1, max_ttl, deleteifexists=True)
-                s.sendto(bytes(out), addr)
-            except BlockingIOError: time.sleep(0.01)
-            except Exception as e:
-                traceback.print_exception(e)
+                # No direct match — check for a CNAME so the recursive
+                # resolver (e.g. 1.1.1.1) can follow the chain itself.
+                qtype_out = question.qtype
+                if not result and question.qtype != DNSType.CNAME and question.qtype in (DNSType.A, DNSType.AAAA):
+                    cname_result, cname_exists = resolve_records(question.qname, DNSType.CNAME, client_ip)
+                    if cname_result:
+                        result = cname_result
+                        exists = cname_exists
+                        qtype_out = DNSType.CNAME
+
+                if result:
+                    ttl, values = result
+                    for value in values:
+                        out.add_answer(DNSAnswer(
+                            question.qname, qtype_out,
+                            DNSClass.IN, ttl, rdata_decoded=value
+                        ))
+                elif exists: out.header.flags.rcode = DNSRCode.NOERROR
+                else: 
+                    out.header.flags.rcode = DNSRCode.NXDOMAIN
+                    soa()
+    edns_options = []
+    for additional in packet.additional:
+        if isinstance(additional, EDNSOptRecord):
+            print(additional)
+            for option in additional.options:
+                match option.code:
+                    case EDNSOptionCode.COOKIE:
+                        edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
+    out.add_additional_rr(EDNSOptRecord(config.getboolean("records", "dnssec", fallback=False), BUFFER_SIZE, edns_options))
+
+    return bytes(out)
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.bind((HOST, PORT))
+    s.settimeout(1)
+    print(f"UDP server listening on {HOST}:{PORT}")
+
+    while True:
+        try:
+            data, addr = s.recvfrom(BUFFER_SIZE)
+            if not data: break
+            out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
+            if out: s.sendto(out, addr)
+        except TimeoutError: pass
+        except Exception as e:
+            traceback.print_exception(e)

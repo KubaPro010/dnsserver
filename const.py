@@ -1,6 +1,4 @@
-from enum import Enum
-
-TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 255: "ANY"}
+from enum import IntEnum
 
 ROOT_SERVERS = {
     "a.root-servers.net": (["198.41.0.4", "2001:503:ba3e::2:30"]), # Managed by Verisign
@@ -18,14 +16,35 @@ ROOT_SERVERS = {
     "m.root-servers.net": (["202.12.27.33", "2001:dc3::35"]) # WIDE Project
 }
 
-class DNSClass(Enum):
+class EDNSOptionCode(IntEnum):
+    RESERVED = 0
+    LLQ = 1
+    UL = 2
+    NSID = 3
+    RESERVED2 = 4
+    DAU = 5
+    DHU = 6
+    N3U = 7
+    ECS = 8
+    EXPIRE = 9
+    COOKIE = 10
+    TCP_KEEPALIVE = 11
+    PADDING = 12
+    CHAIN = 13
+    KEY_TAG = 14
+    EDE = 15
+    CLIENT_TAG = 16
+    SERVER_TAG = 17
+    REPORT = 18
+
+class DNSClass(IntEnum):
     IN = 1
     CS = 2
     CH = 3
     HS = 4
     ANY = 255
 
-class DNSType(Enum):
+class DNSType(IntEnum):
     A = 1
     NS = 2
     CNAME = 5
@@ -55,3 +74,18 @@ class DNSType(Enum):
     AXFR = 252
     ANY = 255
     CAA = 257
+
+class DNSOPCode(IntEnum):
+    QUERY = 0
+    IQUERY = 1
+    STATUS = 2
+    NOTIFY = 4
+    UPDATE = 5
+
+class DNSRCode(IntEnum):
+    NOERROR = 0
+    FORMERR = 1
+    SERVFAIL = 2
+    NXDOMAIN = 3
+    NOTIMP = 4
+    REFUSED = 5
