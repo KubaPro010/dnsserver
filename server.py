@@ -118,6 +118,9 @@ def handle(packet: DNSPacket, client_ip: bytes):
     zone = config["soa"]["zone"]
     primary_ns = config["soa"]["primary_ns"]
 
+    ns_list = config["soa"].get("ns", "").split(",")
+    ns_list = [primary_ns] + ns_list
+
     def soa():
         if config.has_section("soa"):
             email = config["soa"]["email"].replace("@", ".")
@@ -145,10 +148,7 @@ def handle(packet: DNSPacket, client_ip: bytes):
                 soa()
             case _:
                 if question.qtype == DNSType.NS and question.qname == zone:
-                    out.add_answer(DNSAnswer(
-                        zone, DNSType.NS, DNSClass.IN, 300,
-                        rdata_decoded=primary_ns
-                    ))
+                    for ns in ns_list: out.add_answer(DNSAnswer(zone, DNSType.NS, DNSClass.IN, 300, rdata_decoded=ns))
                     continue
 
                 result, exists = resolve_records(question.qname, question.qtype, client_ip)
