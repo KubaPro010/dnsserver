@@ -19,7 +19,7 @@ RECORDS_FILE = pathlib.Path(config["records"]["file"]).resolve()
 ZONE = config["soa"]["zone"].rstrip(".") + "."
 
 HOST = "0.0.0.0"
-PORT = 53
+PORT = config.getint("server", "port", fallback=53)
 
 records_cache = None
 records_mtime = None
@@ -88,9 +88,8 @@ def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
 
     result = records.get((qname, qtype))
     if result:
-        print(result)
-        if result[1][0] == "!":
-            return (1, [socket.inet_ntoa(client_ip)]), True
+        # print(result)
+        if result[1][0] == "!": return (1, [socket.inet_ntoa(client_ip)]), True
         return result, True
 
     # wildcard fallback
@@ -141,7 +140,7 @@ def handle(packet: DNSPacket, client_ip: bytes):
 
     for question in packet.questions:
         out.add_question(question)
-        print(question)
+        # print(question)
 
         match question.qtype:
             case DNSType.SOA:
@@ -177,7 +176,7 @@ def handle(packet: DNSPacket, client_ip: bytes):
     edns_options = []
     for additional in packet.additional:
         if isinstance(additional, EDNSOptRecord):
-            print(additional)
+            # print(additional)
             for option in additional.options:
                 match option.code:
                     case EDNSOptionCode.COOKIE:
