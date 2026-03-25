@@ -205,19 +205,53 @@ def run_periodic(*args, **kwargs):
 def reload_job():
     load_records()
 
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((HOST, PORT))
+def recv_tcp(conn: socket.socket) -> bytes | None:
+    raw_len = conn.recv(2)
+    if len(raw_len) < 2: return None
+    msg_len = int.from_bytes(raw_len, "big")
+    
+    data = b""
+    while len(data) < msg_len:
+        chunk = conn.recv(msg_len - len(data))
+        if not chunk: return None
+        data += chunk
+    return data
+
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+udp.bind((HOST, PORT))
+
+tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+tcp.bind((HOST, TCP_PORT))
+tcp.listen(32)
+
+print(f"UDP listening on {HOST}:{PORT}")
+print(f"TCP listening on {HOST}:{TCP_PORT}")
+
+with udp, tcp:
+    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp.bind((HOST, PORT))
     print(f"UDP server listening on {HOST}:{PORT}")
     load_records() # Preload
+    reset_periodic()
 
     while True:
         try:
-            readable, _, _ = select.select([s], [], [], 1)
-            if readable:
-                data, addr = s.recvfrom(BUFFER_SIZE)
-                if not data: continue
-                out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
-                if out: s.sendto(out, addr)
-            else: run_periodic()
+            readable, _, _ = select.select([udp, tcp], [], [], 1)
+            for sock in readable:
+                if sock is udp:
+                    data, addr = udp.recvfrom(BUFFER_SIZE)
+                    if data:
+                        out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
+                        if out: udp.sendto(out, addr)
+                elif sock is tcp:
+                    conn, addr = tcp.accept()
+                    with conn:
+                        data = recv_tcp(conn)
+                        if data:
+                            out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
+                            if out: conn.sendall(struct.pack("!H", len(out)) + out)
+
+            if not readable: run_periodic()
         except Exception as e: traceback.print_exception(e)
