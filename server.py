@@ -230,9 +230,6 @@ print(f"UDP listening on {HOST}:{PORT}")
 print(f"TCP listening on {HOST}:{TCP_PORT}")
 
 with udp, tcp:
-    udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp.bind((HOST, PORT))
-    print(f"UDP server listening on {HOST}:{PORT}")
     load_records() # Preload
     reset_periodic()
 
