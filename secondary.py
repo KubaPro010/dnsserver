@@ -135,6 +135,9 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         if question.qtype == DNSType.SOA and soa:
             out.add_answer(soa)
             continue
+        elif question.qtype == DNSType.AXFR and raw_records:
+            out.answers = raw_records
+            out.header.num_answers = len(raw_records)
         for record in records.get(question.qname, []):
             found_name = True
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
