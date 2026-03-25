@@ -13,10 +13,10 @@ EDNS_SECRET = random.randbytes(8)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("primary", type=str)
-parser.add_argument("primary_port", type=int, default=53, required=False)
-parser.add_argument("host", type=str, default="0.0.0.0", required=False)
-parser.add_argument("port", type=int, default=53, required=False)
-parser.add_argument("rps", type=int, default=75, required=False)
+parser.add_argument("primary_port", type=int, default=53)
+parser.add_argument("host", type=str, default="0.0.0.0")
+parser.add_argument("port", type=int, default=53)
+parser.add_argument("rps", type=int, default=75)
 args = parser.parse_args()
 
 def query_dns(packet: DNSPacket, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
