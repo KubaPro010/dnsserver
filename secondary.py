@@ -135,11 +135,11 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             out.add_answer(soa)
             continue
         for record in records.get(question.qname, []):
-            if record.type != question.qtype and question.qtype not in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME: continue
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 
-            out.add_answer(record)
-            out.header.flags.rcode = DNSRCode.NOERROR
+            if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
+                out.add_answer(record)
+                out.header.flags.rcode = DNSRCode.NOERROR
     if out.header.flags.rcode == DNSRCode.NXDOMAIN and soa: out.add_authoritive_rr(soa)
    
     max_size = BUFFER_SIZE
