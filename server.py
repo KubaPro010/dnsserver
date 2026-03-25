@@ -4,9 +4,10 @@ import traceback
 import pathlib
 import configparser, argparse
 import hmac, hashlib
+import random
 
 BUFFER_SIZE = 4096
-EDNS_SECRET = b"flerken"
+EDNS_SECRET = random.randbytes(8)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("config", type=str, default="config.ini")
@@ -107,7 +108,7 @@ def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
 def handle(packet: DNSPacket, client_ip: bytes):
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
-        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, False, False, False, False, DNSRCode.NOERROR)
+        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
     ))
     if packet.header.flags.qr: return
     if packet.header.flags.opcode != DNSOPCode.QUERY:
@@ -173,15 +174,17 @@ def handle(packet: DNSPacket, client_ip: bytes):
                 else: 
                     out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa()
+    max_size = BUFFER_SIZE
     edns_options = []
     for additional in packet.additional:
         if isinstance(additional, EDNSOptRecord):
+            if max_size > additional.max_udp_size: max_size = additional.max_udp_size
             # print(additional)
             for option in additional.options:
                 match option.code:
                     case EDNSOptionCode.COOKIE:
                         edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
-    out.add_additional_rr(EDNSOptRecord(config.getboolean("records", "dnssec", fallback=False), BUFFER_SIZE, edns_options))
+    out.add_additional_rr(EDNSOptRecord(config.getboolean("records", "dnssec", fallback=False), max_size, edns_options))
 
     return bytes(out)
 
