@@ -1,7 +1,7 @@
 import struct, socket
 from dataclasses import dataclass, field
-from const import *
-from decode import decode_rdata, decode_name
+from protocol.const import *
+from protocol.decode import decode_rdata, decode_name
 
 @dataclass
 class EDNSOption:
@@ -278,15 +278,15 @@ class DNSAnswer:
 class DNSPacket:
     header: DNSHeader
     questions: list[DNSQuestion] = field(default_factory=list)
-    answers: list[DNSAnswer | EDNSOptRecord] = field(default_factory=list)
-    authority: list[DNSAnswer | EDNSOptRecord] = field(default_factory=list)
+    answers: list[DNSAnswer] = field(default_factory=list)
+    authority: list[DNSAnswer] = field(default_factory=list)
     additional: list[DNSAnswer | EDNSOptRecord] = field(default_factory=list)
 
     def add_question(self, question: DNSQuestion):
         self.header.num_questions += 1
         self.questions.append(question)
         return self
-    def add_answer(self, answer: DNSAnswer | EDNSOptRecord):
+    def add_answer(self, answer: DNSAnswer):
         self.header.num_answers += 1
         self.answers.append(answer)
         return self
@@ -294,7 +294,7 @@ class DNSPacket:
         self.header.num_additional_rr += 1
         self.additional.append(answer)
         return self
-    def add_authoritive_rr(self, answer: DNSAnswer | EDNSOptRecord):
+    def add_authoritive_rr(self, answer: DNSAnswer):
         self.header.num_authority_rr += 1
         self.authority.append(answer)
         return self
@@ -328,7 +328,8 @@ class DNSPacket:
         return "\n".join(lines)
 
     def clear(self):
-        self.additional = self.answers = self.authority = []
+        self.additional = []
+        self.answers = self.authority = []
         self.questions = []
         self.header.num_questions = self.header.num_authority_rr = self.header.num_answers = self.header.num_additional_rr = 0
         self.header.transaction_id += 1

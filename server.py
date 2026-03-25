@@ -1,4 +1,4 @@
-from frame import *
+from protocol.frame import *
 import socket
 import traceback
 import pathlib
@@ -6,8 +6,8 @@ import configparser, argparse
 import hmac, hashlib
 import random
 import select
-from libcounter import Counter
-
+import datetime
+from lib.libcounter import Counter
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
@@ -27,11 +27,16 @@ PORT = config.getint("server", "port", fallback=53)
 TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
 REQUESTS_PER_SECOND = config.getint("server", "rps", fallback=75)
 
+soa_serial = config.getint("soa", "serial", fallback=0) - 1 # -1 is for the preload, so it gets offset to 1
+def compute_soa_serial(d):
+    t = datetime.datetime.now()
+    return (t.year * 1_000_000) + (t.month * 10_000) + (t.day * 100) + d
+
 records_cache = None
 records_mtime = None
 
 def load_records():
-    global records_cache, records_mtime
+    global records_cache, records_mtime, soa_serial
 
     mtime = RECORDS_FILE.stat().st_mtime
     if records_mtime == mtime: return
@@ -58,10 +63,16 @@ def load_records():
 
             key = (name, qtype)
             if key not in records: records[key] = (int(ttl), [])
+            if records[key][0] < int(ttl): 
+                print(f"[warn] mismatching ttl values on {name}, setting all to highest ttl (server does not support multiple ttls as of now)")
+                records[key] = (int(ttl), records[key][1])
             records[key][1].append(value)
 
     records_cache = records
     records_mtime = mtime
+    soa_serial += 1
+    config.set("soa", "serial", str(soa_serial))
+    config.write(args.config)
     print(f"[info] loaded {len(records)} record sets from {RECORDS_FILE}")
 
 def get_records():
@@ -76,6 +87,7 @@ def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
     Returns (ttl, values), name_exists.
     """
     records = get_records()
+    if not records: raise Exception
     qname = qname.rstrip(".") + "."  # normalise
 
     result = records.get((qname, qtype))
@@ -111,6 +123,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         if c.get_rate() > REQUESTS_PER_SECOND:
             out.header.flags.rcode = DNSRCode.REFUSED
             return bytes(out)
+    else: ip_counts[client_ip] = Counter()
 
     if packet.header.flags.qr: return
     if packet.header.flags.opcode != DNSOPCode.QUERY:
@@ -129,12 +142,11 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         refresh = config.getint("soa", "refresh", fallback=3600)
         retry = config.getint("soa", "retry", fallback=1800)
         expire = config.getint("soa", "expire", fallback=1209600)
-        minimum = config.getint("soa", "min", fallback=86400)
-        serial = config.get("soa", "serial", fallback="0")
+        minimum = config.getint("soa", "min", fallback=3600)
         out.add_answer(DNSAnswer(
             zone, DNSType.SOA, DNSClass.IN, ns_ttl,
             rdata_decoded=(
-                f"{primary_ns}. {email}. serial={serial} "
+                f"{primary_ns}. {email}. serial={compute_soa_serial(soa_serial)} "
                 f"refresh={refresh} retry={retry} "
                 f"expire={expire} min={minimum}"
             )
@@ -145,8 +157,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         # print(question)
 
         match question.qtype:
-            case DNSType.SOA:
-                soa()
+            case DNSType.SOA: soa()
             case DNSType.NS:
                 if question.qname == zone:
                     for ns in ns_list: out.add_answer(DNSAnswer(zone, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
@@ -186,6 +197,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 else:
                     out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa()
+   
     max_size = BUFFER_SIZE
     edns_options = []
     for additional in packet.additional:
@@ -197,6 +209,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                     case EDNSOptionCode.COOKIE:
                         edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
     out.add_additional_rr(EDNSOptRecord(config.getboolean("records", "dnssec", fallback=False), max_size, edns_options))
+
     if len(out) > max_size: out.header.flags.tc = True
 
     return bytes(out)[:max_size]
@@ -214,15 +227,16 @@ def recv_tcp(conn: socket.socket) -> bytes | None:
     return data
 
 udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-udp.bind((HOST, PORT))
-
 tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-tcp.bind((HOST, TCP_PORT))
-tcp.listen(32)
 
+udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+udp.bind((HOST, PORT))
+tcp.bind((HOST, TCP_PORT))
 print(f"UDP listening on {HOST}:{PORT}")
+
+tcp.listen(32)
 print(f"TCP listening on {HOST}:{TCP_PORT}")
 
 with udp, tcp:
@@ -244,8 +258,7 @@ with udp, tcp:
                         if data:
                             out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), TCP)
                             if out: conn.sendall(struct.pack("!H", len(out)) + out)
-
             if not readable:
                 load_records()
-                ip_counts = {}
+                ip_counts.clear()
         except Exception as e: traceback.print_exception(e)

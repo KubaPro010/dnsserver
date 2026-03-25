@@ -1,6 +1,6 @@
-from frame import *
+from protocol.frame import *
 import socket
-import libcache2 as libcache
+import lib.libcache2 as libcache
 import select
 
 class RecursiveDNSResolver:
@@ -79,7 +79,7 @@ class RecursiveDNSResolver:
 
             ns_names = []
             for i, authority in enumerate(parsed.authority):
-                if DNSType(authority.type) != DNSType.NS: continue
+                if isinstance(authority, EDNSOptRecord) or DNSType(authority.type) != DNSType.NS: continue
                 ns_names.append(authority.rdata_decoded)
                 print("Saving authority", d, i, authority.rdata_decoded)
                 self.cache.saveElement(f":ns:{d}:{i}", authority.rdata_decoded, authority.ttl, deleteifexists=True)
@@ -87,6 +87,7 @@ class RecursiveDNSResolver:
 
             ns_map = {}
             for additional in parsed.additional:
+                if isinstance(additional, EDNSOptRecord): continue
                 if additional.name in ns_names:
                     orig_v4, orig_v6 = ns_map.get(additional.name, ([], []))
                     if DNSType(additional.type) == DNSType.A: orig_v4.append((additional.rdata_decoded, additional.ttl))
