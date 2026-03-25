@@ -2,6 +2,16 @@ import traceback, socket, select, struct
 from enum import IntEnum
 from protocol.frame import DNSPacket
 
+import tldextract
+def is_subdomain(sub, parent):
+    sub_ext = tldextract.extract(sub)
+    parent_ext = tldextract.extract(parent)
+
+    sub_domain = '.'.join(part for part in [sub_ext.subdomain, sub_ext.domain, sub_ext.suffix] if part)
+    parent_domain = '.'.join(part for part in [parent_ext.domain, parent_ext.suffix] if part)
+
+    return sub_domain == parent_domain or sub_domain.endswith("." + parent_domain)
+
 class Transport(IntEnum):
     UDP = 0
     TCP = 1

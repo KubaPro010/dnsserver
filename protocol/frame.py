@@ -171,8 +171,7 @@ class DNSQuestion:
         return cls(name, DNSType(qtype), DNSClass(qclass)), offset + 4
 
 def encode_name(name: str) -> bytes:
-    if name in ("", "."):
-        return b"\x00"
+    if name in ("", "."): return b"\x00"
     out = b""
     for label in name.rstrip(".").split("."):
         encoded = label.encode()
