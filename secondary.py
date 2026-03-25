@@ -115,7 +115,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     global soa
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
-        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NXDOMAIN)
+        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
     ))
     if (c := ip_counts.get(client_ip)):
         c.beat()
@@ -128,19 +128,24 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     if packet.header.flags.opcode != DNSOPCode.QUERY:
         print("Unhandled opcode:", packet.header.flags.opcode)
         return
-
+    
+    found_name = False
     for question in packet.questions:
         out.add_question(question)
         if question.qtype == DNSType.SOA and soa:
             out.add_answer(soa)
             continue
         for record in records.get(question.qname, []):
+            found_name = True
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 
             if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
                 out.add_answer(record)
                 out.header.flags.rcode = DNSRCode.NOERROR
-    if out.header.flags.rcode == DNSRCode.NXDOMAIN and soa: out.add_authoritive_rr(soa)
+    if found_name: out.header.flags.rcode = DNSRCode.NOERROR
+    else:
+        out.header.flags.rcode = DNSRCode.NXDOMAIN
+        if soa: out.add_authoritive_rr(soa)
    
     max_size = BUFFER_SIZE
     edns_options = []
