@@ -87,6 +87,7 @@ def fetch_records():
     if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception
     data_age = time.monotonic()
     raw_records = res.answers
+    records.clear()
     for anwser in res.answers:
         match anwser.type: 
             case DNSType.SOA:
@@ -113,7 +114,7 @@ TCP = Transport.TCP
 def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
-        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
+        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NXDOMAIN)
     ))
     if (c := ip_counts.get(client_ip)):
         c.beat()
@@ -129,10 +130,12 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
     for question in packet.questions:
         out.add_question(question)
-        for record in records[question.qname]:
+        for record in records.get(question.qname, []):
             if record.type != question.qtype and record.type not in (DNSType.A, DNSType.AAAA) and question.qtype != DNSType.CNAME: continue
-            if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass == record.record_class: continue
+            if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
+
             out.add_answer(record)
+            out.header.flags.rcode = DNSRCode.NOERROR
    
     max_size = BUFFER_SIZE
     edns_options = []
@@ -146,9 +149,10 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                         edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
     out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
 
-    if len(out) > max_size: out.header.flags.tc = True
-
-    return bytes(out)[:max_size]
+    if transport == UDP and len(out) > max_size:
+        out.header.flags.tc = True
+        return bytes(out)[:max_size]
+    return bytes(out)
 
 def recv_tcp(conn: socket.socket) -> bytes | None:
     raw_len = conn.recv(2)
@@ -199,12 +203,12 @@ with udp, tcp:
 
             if not readable: 
                 ip_counts.clear()
-                if time_until_fetch > time.monotonic():
+                if time.monotonic() >= time_until_fetch:
                     retried = False
                     try: 
                         fetch_records()
                         time_until_fetch = data_age + soa_refresh
                     except Exception:
                         retried = True
-                        time_until_fetch += soa_retry
+                        time_until_fetch = time.monotonic() + soa_retry
         except Exception as e: traceback.print_exception(e)

@@ -210,7 +210,10 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
     if len(out) > max_size: out.header.flags.tc = True
 
-    return bytes(out)[:max_size]
+    if transport == UDP and len(out) > max_size:
+        out.header.flags.tc = True
+        return bytes(out)[:max_size]
+    return bytes(out)
 
 def recv_tcp(conn: socket.socket) -> bytes | None:
     raw_len = conn.recv(2)
