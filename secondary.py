@@ -131,10 +131,10 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
     for question in packet.questions:
         out.add_question(question)
+        if question.qtype == DNSType.SOA and soa:
+            out.add_answer(soa)
+            continue
         for record in records.get(question.qname, []):
-            if record.type == DNSType.SOA and soa:
-                out.add_answer(soa)
-                continue
 
             if record.type != question.qtype and question.qtype not in (DNSType.A, DNSType.AAAA) and record.type != DNSType.CNAME: continue
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
