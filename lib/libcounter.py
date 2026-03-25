@@ -11,9 +11,9 @@ class Counter:
         self.ctime = time.monotonic()
         return self.count
 
-    def beat(self) -> int:
+    def beat(self) -> "Counter":
         self.count += 1
-        return self.count
+        return self
 
     def get_rate(self) -> float:
         elapsed = time.monotonic() - self.ctime

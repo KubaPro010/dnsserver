@@ -1,13 +1,10 @@
 from protocol.frame import *
 import socket
-import traceback
-import pathlib
+import pathlib, datetime
 import configparser, argparse
-import hmac, hashlib
-import random
-import select
-import datetime
+import hmac, hashlib, random
 from lib.libcounter import Counter
+from server_base import DNSSocket, UDP, TCP
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
@@ -79,11 +76,6 @@ def get_records():
     return records_cache
 
 def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
-    """
-    Look up (qname, qtype) in the flat records table.
-    Falls back to a wildcard entry keyed as (*.<parent>, qtype).
-    Returns (ttl, values), name_exists.
-    """
     records = get_records()
     if not records: raise Exception
     qname = qname.rstrip(".") + "."  # normalise
@@ -105,12 +97,6 @@ def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
 
 ip_counts: dict[bytes, Counter] = {}
 
-class Transport(IntEnum):
-    UDP = 0
-    TCP = 1
-UDP = Transport.UDP
-TCP = Transport.TCP
-
 def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
@@ -121,7 +107,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         if c.get_rate() > REQUESTS_PER_SECOND:
             out.header.flags.rcode = DNSRCode.REFUSED
             return bytes(out)
-    else: ip_counts[client_ip] = Counter()
+    else: ip_counts[client_ip] = Counter().beat()
 
     if packet.header.flags.qr: return
     if packet.header.flags.opcode != DNSOPCode.QUERY:
@@ -208,58 +194,15 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                         edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
     out.add_additional_rr(EDNSOptRecord(config.getboolean("records", "dnssec", fallback=False), max_size, edns_options))
 
-    if len(out) > max_size: out.header.flags.tc = True
-
     if transport == UDP and len(out) > max_size:
         out.header.flags.tc = True
         return bytes(out)[:max_size]
     return bytes(out)
 
-def recv_tcp(conn: socket.socket) -> bytes | None:
-    raw_len = conn.recv(2)
-    if len(raw_len) < 2: return None
-    msg_len = int.from_bytes(raw_len, "big")
-
-    data = b""
-    while len(data) < msg_len:
-        chunk = conn.recv(msg_len - len(data))
-        if not chunk: return None
-        data += chunk
-    return data
-
-udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-udp.bind((HOST, PORT))
-tcp.bind((HOST, TCP_PORT))
-print(f"UDP listening on {HOST}:{PORT}")
-
-tcp.listen(32)
-print(f"TCP listening on {HOST}:{TCP_PORT}")
-
-with udp, tcp:
-    load_records() # Preload
-
-    while True:
-        try:
-            readable, _, _ = select.select([udp, tcp], [], [], 10)
-            for sock in readable:
-                if sock is udp:
-                    data, addr = udp.recvfrom(BUFFER_SIZE)
-                    if data:
-                        out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), UDP)
-                        if out: udp.sendto(out, addr)
-                elif sock is tcp:
-                    conn, addr = tcp.accept()
-                    with conn:
-                        data = recv_tcp(conn)
-                        if data:
-                            out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), TCP)
-                            if out: conn.sendall(struct.pack("!H", len(out)) + out)
-            if not readable:
-                load_records()
-                ip_counts.clear()
-        except Exception as e: traceback.print_exception(e)
+class PrimaryServer(DNSSocket):
+    def _pre_run(self): load_records()
+    def handle(self, *args, **kwargs): return handle(*args, **kwargs)
+    def _idle(self):
+        load_records()
+        ip_counts.clear()
+PrimaryServer(HOST, PORT, TCP_PORT, BUFFER_SIZE).run()

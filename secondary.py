@@ -1,12 +1,11 @@
 from protocol.frame import *
 import socket
-import traceback
 import argparse
 import hmac, hashlib
 import random
-import select
 from lib.libcounter import Counter
 import time
+from server_base import UDP, TCP, DNSSocket
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
@@ -56,7 +55,6 @@ def query_dns(packet: DNSPacket, timeout: float = 2.0, force_tcp: bool = False) 
 
 HOST = args.host
 PORT = args.port
-TCP_PORT = PORT
 REQUESTS_PER_SECOND = args.rps
 
 soa = None
@@ -70,9 +68,10 @@ records: dict[str, list[DNSAnswer]] = {}
 raw_records: list[DNSAnswer] = []
 
 def fetch_records():
+    def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
     global soa, soa_serial, soa_refresh, soa_retry, soa_expire, data_age, records, soa_zone, raw_records
     if soa_serial != 0 and soa_zone:
-        soa_packet = DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
+        soa_packet = generate_packet()
         soa_packet.add_question(DNSQuestion(soa_zone, DNSType.SOA, DNSClass.IN))
         soa_res = query_dns(soa_packet)
         for aw in soa_res.answers:
@@ -81,8 +80,8 @@ def fetch_records():
             params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
             if soa_serial == int(params["serial"]): return # We have the same serial
     
-    packet = DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
-    packet.add_question(DNSQuestion(soa_zone, DNSType.AXFR, DNSClass.IN))
+    packet = generate_packet()
+    packet.add_question(DNSQuestion(".", DNSType.AXFR, DNSClass.IN))
     res = query_dns(packet, force_tcp=True)
     if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception
     data_age = time.monotonic()
@@ -105,18 +104,19 @@ def fetch_records():
 
 ip_counts: dict[bytes, Counter] = {}
 
-class Transport(IntEnum):
-    UDP = 0
-    TCP = 1
-UDP = Transport.UDP
-TCP = Transport.TCP
-
 def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
-    global soa
+    global soa, data_age, soa_expire
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
         DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
     ))
+
+    if time.monotonic() >= (data_age + soa_expire):
+        out.header.flags.rcode = DNSRCode.SERVFAIL
+        out.questions = packet.questions
+        out.header.num_questions = packet.header.num_questions
+        return bytes(out)
+
     if (c := ip_counts.get(client_ip)):
         c.beat()
         if c.get_rate() > REQUESTS_PER_SECOND:
@@ -169,61 +169,19 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         return bytes(out)[:max_size]
     return bytes(out)
 
-def recv_tcp(conn: socket.socket) -> bytes | None:
-    raw_len = conn.recv(2)
-    if len(raw_len) < 2: return None
-    msg_len = int.from_bytes(raw_len, "big")
-
-    data = b""
-    while len(data) < msg_len:
-        chunk = conn.recv(msg_len - len(data))
-        if not chunk: return None
-        data += chunk
-    return data
-
-udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-udp.bind((HOST, PORT))
-tcp.bind((HOST, TCP_PORT))
-print(f"UDP listening on {HOST}:{PORT}")
-
-tcp.listen(32)
-print(f"TCP listening on {HOST}:{TCP_PORT}")
-
-with udp, tcp:
-    fetch_records()
-    time_until_fetch = data_age + soa_refresh
-    retried = False
-
-    while True:
-        try:
-            readable, _, _ = select.select([udp, tcp], [], [], 10)
-            for sock in readable:
-                if sock is udp:
-                    data, addr = udp.recvfrom(BUFFER_SIZE)
-                    if data:
-                        out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), UDP)
-                        if out: udp.sendto(out, addr)
-                elif sock is tcp:
-                    conn, addr = tcp.accept()
-                    with conn:
-                        data = recv_tcp(conn)
-                        if data:
-                            out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), TCP)
-                            if out: conn.sendall(struct.pack("!H", len(out)) + out)
-
-            if not readable: 
-                ip_counts.clear()
-                if time.monotonic() >= time_until_fetch:
-                    retried = False
-                    try: 
-                        fetch_records()
-                        time_until_fetch = data_age + soa_refresh
-                    except Exception:
-                        retried = True
-                        time_until_fetch = time.monotonic() + soa_retry
-        except Exception as e: traceback.print_exception(e)
+class SecondaryServer(DNSSocket):
+    def handle(self, *args, **kwargs): return handle(*args, **kwargs)
+    def _pre_run(self):
+        global data_age, soa_refresh
+        fetch_records()
+        self.time_until_fetch = data_age + soa_refresh
+    def _idle(self):
+        global data_age, soa_refresh, soa_retry
+        ip_counts.clear()
+        if time.monotonic() >= self.time_until_fetch:
+            try: 
+                fetch_records()
+                self.time_until_fetch = data_age + soa_refresh
+            except Exception:
+                self.time_until_fetch = time.monotonic() + soa_retry
+SecondaryServer(HOST, PORT, PORT, BUFFER_SIZE).run()
