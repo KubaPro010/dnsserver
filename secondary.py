@@ -112,6 +112,7 @@ UDP = Transport.UDP
 TCP = Transport.TCP
 
 def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
+    global soa
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
         DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NXDOMAIN)
@@ -131,11 +132,16 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     for question in packet.questions:
         out.add_question(question)
         for record in records.get(question.qname, []):
-            if record.type != question.qtype and record.type not in (DNSType.A, DNSType.AAAA) and question.qtype != DNSType.CNAME: continue
+            if record.type == DNSType.SOA and soa:
+                out.add_answer(soa)
+                continue
+
+            if record.type != question.qtype and question.qtype not in (DNSType.A, DNSType.AAAA) and record.type != DNSType.CNAME: continue
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 
             out.add_answer(record)
             out.header.flags.rcode = DNSRCode.NOERROR
+    if out.header.flags.rcode == DNSRCode.NXDOMAIN and soa: out.add_answer(soa)
    
     max_size = BUFFER_SIZE
     edns_options = []
