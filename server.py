@@ -95,14 +95,20 @@ def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
 
 ip_counts: dict[bytes, Counter] = {}
 
-def handle(packet: DNSPacket, client_ip: bytes):
+class Transport(IntEnum):
+    UDP = 0
+    TCP = 1
+UDP = Transport.UDP
+TCP = Transport.TCP
+
+def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
         DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
     ))
     if (c := ip_counts.get(client_ip)):
         c.beat()
-        if c.get_rate() > REQUESTS_PER_SECOND: 
+        if c.get_rate() > REQUESTS_PER_SECOND:
             out.header.flags.rcode = DNSRCode.REFUSED
             return bytes(out)
 
@@ -144,6 +150,20 @@ def handle(packet: DNSPacket, client_ip: bytes):
             case DNSType.NS:
                 if question.qname == zone:
                     for ns in ns_list: out.add_answer(DNSAnswer(zone, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
+            case DNSType.AXFR:
+                if transport != TCP or client_ip != socket.inet_aton("127.0.0.1"):
+                    out.header.flags.rcode = DNSRCode.REFUSED
+                    break
+
+                records = get_records()
+                if not records: continue
+
+                soa()
+                for (name, qtype), (ttl, values) in records.items():
+                    for value in values: out.add_answer(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=value))
+                for ns in ns_list: out.add_answer(DNSAnswer(zone, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
+
+                soa()
             case _:
                 result, exists = resolve_records(question.qname, question.qtype, client_ip)
 
@@ -163,7 +183,7 @@ def handle(packet: DNSPacket, client_ip: bytes):
                             DNSClass.IN, ttl, rdata_decoded=value
                         ))
                 elif exists: out.header.flags.rcode = DNSRCode.NOERROR
-                else: 
+                else:
                     out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa()
     max_size = BUFFER_SIZE
@@ -185,7 +205,7 @@ def recv_tcp(conn: socket.socket) -> bytes | None:
     raw_len = conn.recv(2)
     if len(raw_len) < 2: return None
     msg_len = int.from_bytes(raw_len, "big")
-    
+
     data = b""
     while len(data) < msg_len:
         chunk = conn.recv(msg_len - len(data))
@@ -215,14 +235,14 @@ with udp, tcp:
                 if sock is udp:
                     data, addr = udp.recvfrom(BUFFER_SIZE)
                     if data:
-                        out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
+                        out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), UDP)
                         if out: udp.sendto(out, addr)
                 elif sock is tcp:
                     conn, addr = tcp.accept()
                     with conn:
                         data = recv_tcp(conn)
                         if data:
-                            out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
+                            out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), TCP)
                             if out: conn.sendall(struct.pack("!H", len(out)) + out)
 
             if not readable:
