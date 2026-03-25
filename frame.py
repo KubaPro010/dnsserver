@@ -359,3 +359,5 @@ class DNSPacket:
             packet.additional.append(a)
 
         return packet
+
+    def __len__(self): return len(bytes(self))

@@ -5,12 +5,11 @@ import pathlib
 import configparser, argparse
 import hmac, hashlib
 import random
-from typing import Callable
-from libtimer2 import Timer
-from functools import wraps
 import select
+from libcounter import Counter
 
-BUFFER_SIZE = 4096
+
+BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
 
 parser = argparse.ArgumentParser()
@@ -20,12 +19,13 @@ args = parser.parse_args()
 config = configparser.ConfigParser()
 config.read(args.config)
 
-RECORDS_FILE = pathlib.Path(config["records"]["file"]).resolve()
+RECORDS_FILE = pathlib.Path(config["records"]["file"]).resolve().absolute()
 ZONE = config["soa"]["zone"].rstrip(".") + "."
 
 HOST = config.get("server", "host", fallback="0.0.0.0")
 PORT = config.getint("server", "port", fallback=53)
 TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
+REQUESTS_PER_SECOND = config.getint("server", "rps", fallback=75)
 
 records_cache = None
 records_mtime = None
@@ -41,8 +41,7 @@ def load_records():
     with open(RECORDS_FILE) as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+            if not line or line.startswith("#") or line.startswith(";"): continue
             parts = line.split("\t", 3)
             if len(parts) != 4:
                 print(f"[warn] skipping malformed record line: {line!r}")
@@ -52,16 +51,13 @@ def load_records():
             if name == "@": name = ZONE
             elif not name.endswith("."): name = name + "." + ZONE
 
-            try:
-                qtype = DNSType[rtype.upper()]
-                ttl = int(ttl)
+            try: qtype = DNSType[rtype.upper()]
             except (KeyError, ValueError) as e:
                 print(f"[warn] skipping record ({e}): {line!r}")
                 continue
 
             key = (name, qtype)
-            if key not in records:
-                records[key] = (ttl, [])
+            if key not in records: records[key] = (int(ttl), [])
             records[key][1].append(value)
 
     records_cache = records
@@ -92,18 +88,24 @@ def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
     if len(labels) > 1:
         wildcard = "*." + ".".join(labels[1:]) + "."
         result = records.get((wildcard, qtype))
-        if result:
-            return result, True
+        if result: return result, True
 
     name_exists = any(k[0] == qname for k in records)
     return None, name_exists
 
+ip_counts: dict[bytes, Counter] = {}
 
 def handle(packet: DNSPacket, client_ip: bytes):
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
         DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
     ))
+    if (c := ip_counts.get(client_ip)):
+        c.beat()
+        if c.get_rate() > REQUESTS_PER_SECOND: 
+            out.header.flags.rcode = DNSRCode.REFUSED
+            return bytes(out)
+
     if packet.header.flags.qr: return
     if packet.header.flags.opcode != DNSOPCode.QUERY:
         print("Unhandled opcode:", packet.header.flags.opcode)
@@ -111,27 +113,26 @@ def handle(packet: DNSPacket, client_ip: bytes):
 
     zone = config["soa"]["zone"]
     primary_ns = config["soa"]["primary_ns"]
+    ns_ttl = config.getint("soa", "ttl", fallback=300)
 
     ns_list = config["soa"].get("ns", "").split(",")
     ns_list = [primary_ns] + ns_list
 
     def soa():
-        if config.has_section("soa"):
-            email = config["soa"]["email"].replace("@", ".")
-            refresh = config.getint("soa", "refresh", fallback=3600)
-            retry = config.getint("soa", "retry", fallback=1800)
-            expire = config.getint("soa", "expire", fallback=1209600)
-            minimum = config.getint("soa", "min", fallback=86400)
-            serial = config.get("soa", "serial", fallback="0")
-            ttl = config.getint("soa", "ttl", fallback=300)
-            out.add_answer(DNSAnswer(
-                zone, DNSType.SOA, DNSClass.IN, ttl,
-                rdata_decoded=(
-                    f"{primary_ns}. {email}. serial={serial} "
-                    f"refresh={refresh} retry={retry} "
-                    f"expire={expire} min={minimum}"
-                )
-            ))
+        email = config["soa"]["email"].replace("@", ".")
+        refresh = config.getint("soa", "refresh", fallback=3600)
+        retry = config.getint("soa", "retry", fallback=1800)
+        expire = config.getint("soa", "expire", fallback=1209600)
+        minimum = config.getint("soa", "min", fallback=86400)
+        serial = config.get("soa", "serial", fallback="0")
+        out.add_answer(DNSAnswer(
+            zone, DNSType.SOA, DNSClass.IN, ns_ttl,
+            rdata_decoded=(
+                f"{primary_ns}. {email}. serial={serial} "
+                f"refresh={refresh} retry={retry} "
+                f"expire={expire} min={minimum}"
+            )
+        ))
 
     for question in packet.questions:
         out.add_question(question)
@@ -140,11 +141,10 @@ def handle(packet: DNSPacket, client_ip: bytes):
         match question.qtype:
             case DNSType.SOA:
                 soa()
+            case DNSType.NS:
+                if question.qname == zone:
+                    for ns in ns_list: out.add_answer(DNSAnswer(zone, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
             case _:
-                if question.qtype == DNSType.NS and question.qname == zone:
-                    for ns in ns_list: out.add_answer(DNSAnswer(zone, DNSType.NS, DNSClass.IN, 300, rdata_decoded=ns))
-                    continue
-
                 result, exists = resolve_records(question.qname, question.qtype, client_ip)
 
                 qtype_out = question.qtype
@@ -177,33 +177,9 @@ def handle(packet: DNSPacket, client_ip: bytes):
                     case EDNSOptionCode.COOKIE:
                         edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
     out.add_additional_rr(EDNSOptRecord(config.getboolean("records", "dnssec", fallback=False), max_size, edns_options))
+    if len(out) > max_size: out.header.flags.tc = True
 
-    return bytes(out)
-
-PERIODIC_FUNCTIONS: list[tuple[Callable, float, Timer]] = []
-
-def periodic(t: float):
-    def decorator(func):
-        PERIODIC_FUNCTIONS.append((func, t, Timer()))
-        @wraps(func)
-        def wrapper(*args, **kwargs): return func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-def reset_periodic():
-    for (_, _, timer) in PERIODIC_FUNCTIONS: timer.reset()
-
-def run_periodic(*args, **kwargs):
-    for (func, t, timer) in PERIODIC_FUNCTIONS:
-        count = 0
-        while timer.get_time() > t and count < 5:
-            func(*args, **kwargs)
-            timer.subtract(t)
-            count += 1
-
-@periodic(5)
-def reload_job():
-    load_records()
+    return bytes(out)[:max_size]
 
 def recv_tcp(conn: socket.socket) -> bytes | None:
     raw_len = conn.recv(2)
@@ -231,11 +207,10 @@ print(f"TCP listening on {HOST}:{TCP_PORT}")
 
 with udp, tcp:
     load_records() # Preload
-    reset_periodic()
 
     while True:
         try:
-            readable, _, _ = select.select([udp, tcp], [], [], 1)
+            readable, _, _ = select.select([udp, tcp], [], [], 10)
             for sock in readable:
                 if sock is udp:
                     data, addr = udp.recvfrom(BUFFER_SIZE)
@@ -250,5 +225,7 @@ with udp, tcp:
                             out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
                             if out: conn.sendall(struct.pack("!H", len(out)) + out)
 
-            if not readable: run_periodic()
+            if not readable:
+                load_records()
+                ip_counts = {}
         except Exception as e: traceback.print_exception(e)
