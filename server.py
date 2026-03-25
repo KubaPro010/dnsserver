@@ -135,13 +135,13 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     ns_list = config["soa"].get("ns", "").split(",")
     ns_list = [primary_ns] + ns_list
 
-    def soa():
+    def soa(add_func = out.add_answer):
         email = config["soa"]["email"].replace("@", ".")
         refresh = config.getint("soa", "refresh", fallback=3600)
         retry = config.getint("soa", "retry", fallback=1800)
         expire = config.getint("soa", "expire", fallback=1209600)
         minimum = config.getint("soa", "min", fallback=3600)
-        out.add_answer(DNSAnswer(
+        add_func(DNSAnswer(
             zone, DNSType.SOA, DNSClass.IN, ns_ttl,
             rdata_decoded=(
                 f"{primary_ns}. {email}. serial={compute_soa_serial(soa_serial)} "
@@ -194,7 +194,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 elif exists: out.header.flags.rcode = DNSRCode.NOERROR
                 else:
                     out.header.flags.rcode = DNSRCode.NXDOMAIN
-                    soa()
+                    soa(out.add_authoritive_rr)
    
     max_size = BUFFER_SIZE
     edns_options = []

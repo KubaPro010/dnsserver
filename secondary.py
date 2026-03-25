@@ -60,7 +60,7 @@ TCP_PORT = PORT
 REQUESTS_PER_SECOND = args.rps
 
 soa = None
-soa_zone = None
+soa_zone = ""
 soa_serial = 0
 soa_refresh = 0
 soa_retry = 0
@@ -82,7 +82,7 @@ def fetch_records():
             if soa_serial == int(params["serial"]): return # We have the same serial
     
     packet = DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
-    packet.add_question(DNSQuestion(".", DNSType.AXFR, DNSClass.IN))
+    packet.add_question(DNSQuestion(soa_zone, DNSType.AXFR, DNSClass.IN))
     res = query_dns(packet, force_tcp=True)
     if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception
     data_age = time.monotonic()
@@ -135,13 +135,12 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             out.add_answer(soa)
             continue
         for record in records.get(question.qname, []):
-
-            if record.type != question.qtype and question.qtype not in (DNSType.A, DNSType.AAAA) and record.type != DNSType.CNAME: continue
+            if record.type != question.qtype and question.qtype not in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME: continue
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 
             out.add_answer(record)
             out.header.flags.rcode = DNSRCode.NOERROR
-    if out.header.flags.rcode == DNSRCode.NXDOMAIN and soa: out.add_answer(soa)
+    if out.header.flags.rcode == DNSRCode.NXDOMAIN and soa: out.add_authoritive_rr(soa)
    
     max_size = BUFFER_SIZE
     edns_options = []
