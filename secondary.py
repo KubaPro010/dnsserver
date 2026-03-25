@@ -11,7 +11,17 @@ import time
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
 
-def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
+parser = argparse.ArgumentParser()
+parser.add_argument("primary", type=str)
+parser.add_argument("primary_port", type=int, default=53, required=False)
+parser.add_argument("host", type=str, default="0.0.0.0", required=False)
+parser.add_argument("port", type=int, default=53, required=False)
+parser.add_argument("rps", type=int, default=75, required=False)
+args = parser.parse_args()
+
+def query_dns(packet: DNSPacket, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
+    server_host = args.primary
+    port = args.primary_port
     packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
     if not force_tcp:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -44,13 +54,6 @@ def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: floa
         return DNSPacket.from_bytes(data)
     finally: tcp.close()
 
-parser = argparse.ArgumentParser()
-parser.add_argument("primary", type=str)
-parser.add_argument("host", type=str, default="0.0.0.0")
-parser.add_argument("port", type=int, default=53)
-parser.add_argument("rps", type=int, default=75)
-args = parser.parse_args()
-
 HOST = args.host
 PORT = args.port
 TCP_PORT = PORT
@@ -71,7 +74,7 @@ def fetch_records():
     if soa_serial != 0 and soa_zone:
         soa_packet = DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
         soa_packet.add_question(DNSQuestion(soa_zone, DNSType.SOA, DNSClass.IN))
-        soa_res = query_dns(soa_packet, args.primary)
+        soa_res = query_dns(soa_packet)
         for aw in soa_res.answers:
             if aw.type != DNSType.SOA: continue
             tokens = aw.rdata_decoded.split()
@@ -80,7 +83,7 @@ def fetch_records():
     
     packet = DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
     packet.add_question(DNSQuestion(".", DNSType.AXFR, DNSClass.IN))
-    res = query_dns(packet, args.primary, force_tcp=True)
+    res = query_dns(packet, force_tcp=True)
     if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception
     data_age = time.monotonic()
     raw_records = res.answers
