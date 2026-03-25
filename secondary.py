@@ -72,7 +72,7 @@ class SOAData:
 
 soas: dict[str, SOAData] = {}
 
-records: dict[str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]]
+records: dict[str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]] = {}
 
 def fetch_record(zone):
     def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
