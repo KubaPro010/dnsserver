@@ -5,6 +5,10 @@ import pathlib
 import configparser, argparse
 import hmac, hashlib
 import random
+from typing import Callable
+from libtimer2 import Timer
+from functools import wraps
+import select
 
 BUFFER_SIZE = 4096
 EDNS_SECRET = random.randbytes(8)
@@ -19,28 +23,18 @@ config.read(args.config)
 RECORDS_FILE = pathlib.Path(config["records"]["file"]).resolve()
 ZONE = config["soa"]["zone"].rstrip(".") + "."
 
-HOST = "0.0.0.0"
+HOST = config.get("server", "host", fallback="0.0.0.0")
 PORT = config.getint("server", "port", fallback=53)
+TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
 
 records_cache = None
 records_mtime = None
 
 def load_records():
-    """
-    Load records from a tab-separated file.
-    Format (one record per line):
-        type  name  ttl  value
-    Name rules:
-        @        → zone apex
-        www      → relative, zone appended  (www.example.com.)
-        foo.org. → trailing dot = FQDN, used as-is
-    Lines starting with # are ignored.
-    """
     global records_cache, records_mtime
 
     mtime = RECORDS_FILE.stat().st_mtime
-    if records_mtime == mtime:
-        return records_cache
+    if records_mtime == mtime: return
 
     records = {}  # (qname, qtype) -> (ttl, [values])
 
@@ -55,11 +49,8 @@ def load_records():
                 continue
             rtype, name, ttl, value = parts
 
-            if name == "@":
-                name = ZONE
-            elif not name.endswith("."):
-                name = name + "." + ZONE
-            # else already a FQDN
+            if name == "@": name = ZONE
+            elif not name.endswith("."): name = name + "." + ZONE
 
             try:
                 qtype = DNSType[rtype.upper()]
@@ -76,7 +67,11 @@ def load_records():
     records_cache = records
     records_mtime = mtime
     print(f"[info] loaded {len(records)} record sets from {RECORDS_FILE}")
-    return records
+
+def get_records():
+    if records_cache: return records_cache
+    load_records()
+    return records_cache
 
 def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
     """
@@ -84,12 +79,11 @@ def resolve_records(qname: str, qtype: DNSType, client_ip: bytes):
     Falls back to a wildcard entry keyed as (*.<parent>, qtype).
     Returns (ttl, values), name_exists.
     """
-    records = load_records()
+    records = get_records()
     qname = qname.rstrip(".") + "."  # normalise
 
     result = records.get((qname, qtype))
     if result:
-        # print(result)
         if result[1][0] == "!": return (1, [socket.inet_ntoa(client_ip)]), True
         return result, True
 
@@ -153,8 +147,6 @@ def handle(packet: DNSPacket, client_ip: bytes):
 
                 result, exists = resolve_records(question.qname, question.qtype, client_ip)
 
-                # No direct match — check for a CNAME so the recursive
-                # resolver (e.g. 1.1.1.1) can follow the chain itself.
                 qtype_out = question.qtype
                 if not result and question.qtype != DNSType.CNAME and question.qtype in (DNSType.A, DNSType.AAAA):
                     cname_result, cname_exists = resolve_records(question.qname, DNSType.CNAME, client_ip)
@@ -188,18 +180,44 @@ def handle(packet: DNSPacket, client_ip: bytes):
 
     return bytes(out)
 
+PERIODIC_FUNCTIONS: list[tuple[Callable, float, Timer]] = []
+
+def periodic(t: float):
+    def decorator(func):
+        PERIODIC_FUNCTIONS.append((func, t, Timer()))
+        @wraps(func)
+        def wrapper(*args, **kwargs): return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+def reset_periodic():
+    for (_, _, timer) in PERIODIC_FUNCTIONS: timer.reset()
+
+def run_periodic(*args, **kwargs):
+    for (func, t, timer) in PERIODIC_FUNCTIONS:
+        count = 0
+        while timer.get_time() > t and count < 5:
+            func(*args, **kwargs)
+            timer.subtract(t)
+            count += 1
+
+@periodic(5)
+def reload_job():
+    load_records()
+
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))
-    s.settimeout(1)
     print(f"UDP server listening on {HOST}:{PORT}")
+    load_records() # Preload
 
     while True:
         try:
-            data, addr = s.recvfrom(BUFFER_SIZE)
-            if not data: break
-            out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
-            if out: s.sendto(out, addr)
-        except TimeoutError: pass
-        except Exception as e:
-            traceback.print_exception(e)
+            readable, _, _ = select.select([s], [], [], 1)
+            if readable:
+                data, addr = s.recvfrom(BUFFER_SIZE)
+                if not data: continue
+                out = handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]))
+                if out: s.sendto(out, addr)
+            else: run_periodic()
+        except Exception as e: traceback.print_exception(e)
