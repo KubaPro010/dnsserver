@@ -82,14 +82,14 @@ class DNSHeader_Flags:
     def __int__(self):
         return (
             self.qr << 15 |
-            (self.opcode.value & 0b1111) << 11 |
+            (self.opcode & 0b1111) << 11 |
             self.aa << 10 |
             self.tc << 9 |
             self.rd << 8 |
             self.ra << 7 |
             self.ad << 5 |
             self.cd << 4 |
-            self.rcode.value & 0b1111
+            self.rcode & 0b1111
         )
 
     def __bytes__(self): return struct.pack("!H", int(self))
@@ -157,7 +157,7 @@ class DNSQuestion:
             if len(label) > 63: raise ValueError(f"DNS label too long: {label}")
             out += struct.pack("!B", len(label)) + label
         out += b"\x00"
-        out += struct.pack("!HH", self.qtype.value, self.qclass)
+        out += struct.pack("!HH", self.qtype, self.qclass)
         return out
 
     def __bytes__(self): return self.to_bytes()
@@ -253,7 +253,7 @@ class DNSAnswer:
         rdata = self.get_rdata_bytes()
         rest = struct.pack(
             "!HHIH",
-            self.type.value,
+            self.type,
             self.record_class,
             self.ttl,
             len(rdata)
