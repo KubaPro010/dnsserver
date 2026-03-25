@@ -22,7 +22,7 @@ args = parser.parse_args()
 
 def query_dns(packet: DNSPacket, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
     server_host = args.primary
-    port = args.primary_port
+    port = args.primaryport
     packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
     if not force_tcp:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
