@@ -27,7 +27,7 @@ PORT = config.getint("server", "port", fallback=53)
 TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
 REQUESTS_PER_SECOND = config.getint("server", "rps", fallback=75)
 
-soa_serial = config.getint("soa", "serial", fallback=0) - 1 # -1 is for the preload, so it gets offset to 1
+soa_serial = config.getint("soa", "serial", fallback=0)
 def compute_soa_serial(d):
     t = datetime.datetime.now()
     return (t.year * 1_000_000) + (t.month * 10_000) + (t.day * 100) + d
@@ -71,8 +71,6 @@ def load_records():
     records_cache = records
     records_mtime = mtime
     soa_serial += 1
-    config.set("soa", "serial", str(soa_serial))
-    config.write(args.config)
     print(f"[info] loaded {len(records)} record sets from {RECORDS_FILE}")
 
 def get_records():
