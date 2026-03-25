@@ -136,6 +136,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             out.add_answer(soa)
             continue
         elif question.qtype == DNSType.AXFR and raw_records:
+            found_name = True
             out.answers = raw_records
             out.header.num_answers = len(raw_records)
             continue
