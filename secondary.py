@@ -160,6 +160,15 @@ def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
 def fetch_records():
     for zone in args.zone: fetch_record(zone)
 
+def find_wildcard(qname: str, zone: str, zone_records: dict[str, list[DNSAnswer]]) -> list[DNSAnswer]:
+    labels = qname.split(".")
+    zone_labels = zone.split(".")
+    
+    for i in range(len(labels) - len(zone_labels)):
+        candidate = "*." + ".".join(labels[i+1:])
+        if candidate in zone_records: return zone_records[candidate]
+    return []
+
 to_fetch: list[tuple[DNSAnswer | None, str]] = []
 
 ip_counts: dict[bytes, Counter] = {}
@@ -235,7 +244,9 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             out.header.num_answers = len(out.answers)
             continue
 
-        for record in zone_records.get(question.qname, []):
+        rrs = zone_records.get(question.qname)
+        if not rrs: rrs = find_wildcard(question.qname, this_zone, zone_records)
+        for record in rrs:
             if record.name == this_zone: found_name = True
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 

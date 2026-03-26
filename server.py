@@ -215,9 +215,7 @@ class Zone:
     def resolve(self, qname: str, qtype: DNSType, client_ip: bytes):
         qname = qname.rstrip(".") + "."
         result = self.records_cache.get((qname, qtype))
-        if result:
-            if result[1][0] == "!": return (1, [socket.inet_ntoa(client_ip)]), True
-            return result, True
+        if result: return result, True
 
         labels = qname.rstrip(".").split(".")
         if len(labels) > 1:
