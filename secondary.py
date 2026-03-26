@@ -152,6 +152,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         out.add_question(question)
 
         if question.qtype == DNSType.SOA:
+            found_name = True
             out.add_answer(soa.record)
             continue
         elif question.qtype == DNSType.AXFR and client_ip == socket.inet_aton("127.0.0.1"):
@@ -165,7 +166,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
             if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
                 out.add_answer(record)
-                out.header.flags.rcode = DNSRCode.NOERROR
+                found_name = True
     if found_name: 
         out.header.flags.rcode = DNSRCode.NOERROR
         if len(out.answers) == 0:
