@@ -381,7 +381,9 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 if result:
                     ttl, values = result
                     for value in values: out.add_answer(DNSAnswer(question.qname, qtype_out, DNSClass.IN, ttl, rdata_decoded=value))
-                elif exists: out.header.flags.rcode = DNSRCode.NOERROR
+                elif exists: 
+                    out.header.flags.rcode = DNSRCode.NOERROR
+                    soa(out.add_authoritive_rr)
                 else:
                     if qask != zone.name: out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa(out.add_authoritive_rr)
