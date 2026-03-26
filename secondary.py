@@ -129,6 +129,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         print("Unhandled opcode:", packet.header.flags.opcode)
         return
     
+    soas_here = []
     found_name = False
     for question in packet.questions:
         this_zone = None
@@ -139,6 +140,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 best_len = len(zone)
         if not this_zone: continue
         soa = soas[this_zone]
+        soas_here.append(soa)
         raw_zone_records, zone_records = records[this_zone]
 
         if time.monotonic() >= (soa.age + soa.expire):
@@ -166,10 +168,13 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 out.header.flags.rcode = DNSRCode.NOERROR
     if found_name: 
         out.header.flags.rcode = DNSRCode.NOERROR
-        if len(out.answers) == 0: out.add_authoritive_rr(soa.record)
+        if len(out.answers) == 0:
+            out.authority += soas_here
+            out.header.num_authority_rr += len(soas_here)
     else:
         out.header.flags.rcode = DNSRCode.NXDOMAIN
-        out.add_authoritive_rr(soa.record)
+        out.authority += soas_here
+        out.header.num_authority_rr += len(soas_here)
    
     max_size = BUFFER_SIZE
     edns_options = []
