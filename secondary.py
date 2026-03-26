@@ -244,8 +244,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             out.header.num_answers = len(out.answers)
             continue
 
-        rrs = zone_records.get(question.qname)
-        if not rrs: rrs = find_wildcard(question.qname, this_zone, zone_records)
+        rrs = zone_records.get(question.qname, []) + find_wildcard(question.qname, this_zone, zone_records)
         for record in rrs:
             if record.name == this_zone: found_name = True
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
