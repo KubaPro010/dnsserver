@@ -155,10 +155,13 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             return bytes(out)
     else: ip_counts[client_ip] = Counter().beat()
 
-    if packet.header.flags.qr: return
+    if packet.header.flags.qr:
+        out.header.flags.rcode = DNSRCode.REFUSED
+        return bytes(out)
     if packet.header.flags.opcode != DNSOPCode.QUERY:
         print("Unhandled opcode:", packet.header.flags.opcode)
-        return
+        out.header.flags.rcode = DNSRCode.NOTIMP
+        return bytes(out)
 
     for question in packet.questions:
         out.add_question(question)

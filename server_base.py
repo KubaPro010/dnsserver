@@ -49,7 +49,7 @@ class DNSSocket:
         self.tcp = tcp
         self.udp = udp
         self.buffer_size = buffer_size
-    def handle(self, *args, **kwargs): pass
+    def handle(self, *args, **kwargs) -> bytes: return b""
     def run(self):
         with self.udp as udp, self.tcp as tcp:
             self._pre_run()
@@ -59,15 +59,13 @@ class DNSSocket:
                     for sock in readable:
                         if sock is udp:
                             data, addr = udp.recvfrom(self.buffer_size)
-                            if data:
-                                out = self.handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), UDP)
-                                if out: udp.sendto(out, addr)
+                            if data: udp.sendto(self.handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), UDP), addr)
                         elif sock is tcp:
                             conn, addr = tcp.accept()
                             with conn:
                                 data = self._recv_tcp(conn)
                                 if data:
                                     out = self.handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), TCP)
-                                    if out: conn.sendall(struct.pack("!H", len(out)) + out)
+                                    conn.sendall(struct.pack("!H", len(out)) + out)
                     if not readable: self._idle()
                 except Exception as e: traceback.print_exception(e)
