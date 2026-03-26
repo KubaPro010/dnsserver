@@ -162,6 +162,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             continue
     
         for record in zone_records.get(question.qname, []):
+            if record.name == this_zone: found_name = True
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 
             if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
