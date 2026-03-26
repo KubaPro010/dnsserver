@@ -179,10 +179,14 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
         if question.qtype == DNSType.SOA:
             found_name = True
+            all_nxdomain = False
+            any_found = True
             out.add_answer(soa.record)
             continue
         elif question.qtype == DNSType.AXFR and client_ip == socket.inet_aton("127.0.0.1"):
             found_name = True
+            all_nxdomain = False
+            any_found = True
             out.answers = raw_zone_records
             out.header.num_answers = len(out.answers)
             continue
@@ -236,7 +240,7 @@ class SecondaryServer(DNSSocket):
             try: fetch_record(zone, soa_record)
             except Exception: pass
         to_fetch.clear()
-        
+
         for soa in soas.values():
             if time.monotonic() >= soa.age + soa.refresh + soa.extra_time:
                 try:
