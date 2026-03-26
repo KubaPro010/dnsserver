@@ -6,6 +6,7 @@ import hmac, hashlib, random
 from dataclasses import dataclass, field
 from lib.libcounter import Counter
 from server_base import DNSSocket, UDP, TCP, is_subdomain
+import threading
 
 def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 3.0, force_tcp: bool = False) -> DNSPacket:
     packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
@@ -65,6 +66,7 @@ class Zone:
     serial: int = 0
     records_cache: dict = field(default_factory=dict)
     records_mtime: float | None = None
+    notify_thread: threading.Thread | None = None
 
     def axfr_allowed(self, client_ip: bytes) -> bool:
         if socket.inet_aton("127.0.0.1") == client_ip: return True
@@ -76,17 +78,21 @@ class Zone:
 
     def notify_all_ns(self):
         def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.NOTIFY, True, False, False, False, False, False, DNSRCode.NOERROR)))
-        for ns in self.ns_list:
-            if ns == self.primary_ns: continue
+        primary_ns = self.primary_ns
+        soa_cfg = self.soa_cfg
+        serial = self.serial
+        name = self.name
+        for ns in self.ns_list[:]:
+            if ns == primary_ns: continue
 
-            packet = generate_packet().add_question(DNSQuestion(self.name, DNSType.SOA, DNSClass.IN))
-            email = self.soa_cfg["email"].replace("@", ".")
+            packet = generate_packet().add_question(DNSQuestion(name, DNSType.SOA, DNSClass.IN))
+            email = soa_cfg["email"].replace("@", ".")
             packet.add_answer(DNSAnswer(
-                self.name, DNSType.SOA, DNSClass.IN, self.soa_cfg["ttl"],
+                name, DNSType.SOA, DNSClass.IN, soa_cfg["ttl"],
                 rdata_decoded=(
-                    f"{self.primary_ns}. {email}. serial={self.compute_soa_serial()} "
-                    f"refresh={self.soa_cfg['refresh']} retry={self.soa_cfg['retry']} "
-                    f"expire={self.soa_cfg['expire']} min={self.soa_cfg['min']}"
+                    f"{primary_ns}. {email}. serial={self.compute_soa_serial(serial)} "
+                    f"refresh={soa_cfg['refresh']} retry={soa_cfg['retry']} "
+                    f"expire={soa_cfg['expire']} min={soa_cfg['min']}"
                 )
             ))
             def retry(i: int):
@@ -96,9 +102,10 @@ class Zone:
                     if i < 2: retry(i+1)
             retry(0)
 
-    def compute_soa_serial(self):
+    def compute_soa_serial(self, serial: int | None = None):
+        if serial is None: serial = self.serial
         t = datetime.datetime.now()
-        return (t.year * 1_000_000) + (t.month * 10_000) + (t.day * 100) + self.serial
+        return (t.year * 1_000_000) + (t.month * 10_000) + (t.day * 100) + serial
 
     def load(self):
         mtime = self.records_file.stat().st_mtime
@@ -134,7 +141,11 @@ class Zone:
         self.records_cache = records
         self.records_mtime = mtime
         self.serial += 1
-        self.notify_all_ns()
+
+        if self.notify_thread: self.notify_thread.join()
+        self.notify_thread = threading.Thread(target=self.notify_all_ns)
+        self.notify_thread.run()
+
         print(f"[info] [{self.name}] loaded {len(records)} record sets")
 
     def resolve(self, qname: str, qtype: DNSType, client_ip: bytes):
