@@ -103,7 +103,7 @@ def fetch_record(zone):
                 tokens = anwser.rdata_decoded.split()
                 params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
 
-                soas[anwser.name] = SOAData(anwser, anwser.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), data_age)
+                soas[anwser.name] = SOAData(anwser, anwser.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
             case _: out.setdefault(anwser.name, []).append(anwser)
     records[zone] = (res.answers, out)
 
@@ -159,13 +159,14 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             continue
     
         for record in zone_records.get(question.qname, []):
-            found_name = True
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 
             if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
                 out.add_answer(record)
                 out.header.flags.rcode = DNSRCode.NOERROR
-    if found_name: out.header.flags.rcode = DNSRCode.NOERROR
+    if found_name: 
+        out.header.flags.rcode = DNSRCode.NOERROR
+        if len(out.answers) == 0: out.add_authoritive_rr(soa.record)
     else:
         out.header.flags.rcode = DNSRCode.NXDOMAIN
         out.add_authoritive_rr(soa.record)

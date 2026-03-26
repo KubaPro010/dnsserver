@@ -167,6 +167,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         if zone is None or not zone.records_cache:
             out.header.flags.rcode = DNSRCode.REFUSED
             continue
+        qask = question.qname.rstrip(".") + "."
 
         ns_ttl = zone.soa_cfg["ttl"]
 
@@ -184,7 +185,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         match question.qtype:
             case DNSType.SOA: soa()
             case DNSType.NS:
-                if question.qname.rstrip(".") + "." == zone.name:
+                if qask == zone.name:
                     for ns in zone.ns_list: out.add_answer(DNSAnswer(zone.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
             case DNSType.AXFR:
                 if transport == TCP and zone.axfr_allowed(client_ip):
@@ -208,7 +209,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                     for value in values: out.add_answer(DNSAnswer(question.qname, qtype_out, DNSClass.IN, ttl, rdata_decoded=value))
                 elif exists: out.header.flags.rcode = DNSRCode.NOERROR
                 else:
-                    out.header.flags.rcode = DNSRCode.NXDOMAIN
+                    if qask != zone.name: out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa(out.add_authoritive_rr)
 
     max_size = BUFFER_SIZE
