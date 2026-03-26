@@ -77,6 +77,8 @@ class Zone:
     def notify_all_ns(self):
         def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.NOTIFY, True, False, False, False, False, False, DNSRCode.NOERROR)))
         for ns in self.ns_list:
+            if ns == self.primary_ns: continue
+
             packet = generate_packet().add_question(DNSQuestion(self.name, DNSType.SOA, DNSClass.IN))
             email = self.soa_cfg["email"].replace("@", ".")
             packet.add_answer(DNSAnswer(
@@ -87,10 +89,12 @@ class Zone:
                     f"expire={self.soa_cfg['expire']} min={self.soa_cfg['min']}"
                 )
             ))
-            try: query_dns(packet, ns)
-            except Exception as e:
-                print(f"Could not notify {ns} ({e})")
-                continue
+            def retry(i: int):
+                try: query_dns(packet, ns)
+                except Exception as e:
+                    print(f"Could not notify {ns} ({e})")
+                    if i < 2: retry(i+1)
+            retry(0)
 
     def compute_soa_serial(self):
         t = datetime.datetime.now()
