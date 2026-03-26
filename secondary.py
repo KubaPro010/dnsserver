@@ -141,7 +141,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             if aw.type == DNSType.SOA:
                 soa_record = aw
                 break
-        if zone in soas and client_ip == socket.inet_aton(args.primary):
+        if zone in soas and client_ip == socket.inet_aton(socket.gethostbyname(args.primary)):
             try: fetch_record(zone, soa_record)
             except Exception: pass
         packet.header.flags.qr = True
