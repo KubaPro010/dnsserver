@@ -87,7 +87,10 @@ class Zone:
                     f"expire={self.soa_cfg['expire']} min={self.soa_cfg['min']}"
                 )
             ))
-            query_dns(packet, ns)
+            try: query_dns(packet, ns)
+            except Exception as e:
+                print(f"Could not notify {ns} ({e})")
+                continue
 
     def compute_soa_serial(self):
         t = datetime.datetime.now()
