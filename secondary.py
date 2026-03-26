@@ -251,6 +251,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
 
             if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
+                record.name = question.qname
                 out.add_answer(record)
                 found_name = True
 
