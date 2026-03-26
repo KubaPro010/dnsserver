@@ -5,7 +5,7 @@ import hmac, hashlib
 import random
 from lib.libcounter import Counter
 import time
-from server_base import UDP, TCP, DNSSocket, is_subdomain
+from server_base import UDP, TCP, DNSSocket, is_subdomain, _parse_soa_serial
 from dataclasses import dataclass
 
 BUFFER_SIZE = 1232
@@ -74,11 +74,61 @@ soas: dict[str, SOAData] = {}
 
 records: dict[str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]] = {}
 
+def parse_axfr(packet: DNSPacket, zone: str):
+    def delete_zone(zone): records.pop(zone, None)
+    data_age = time.monotonic()
+    delete_zone(zone)
+
+    if not packet.answers or packet.answers[0].type != DNSType.SOA or packet.answers[-1].type != DNSType.SOA: raise Exception("Invalid AXFR: missing SOA boundaries")
+
+    out = {}
+    for anwser in packet.answers:
+        match anwser.type:
+            case DNSType.SOA:
+                tokens = anwser.rdata_decoded.split()
+                params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
+
+                soas[anwser.name] = SOAData(anwser, anwser.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
+            case _: out.setdefault(anwser.name, []).append(anwser)
+    records[zone] = (packet.answers, out)
+
+def parse_ixfr(packet: DNSPacket, zone: str):
+    data_age = time.monotonic()
+    if (packet.answers[0].type != DNSType.SOA or 
+        packet.answers[-1].type != DNSType.SOA): raise Exception("Invalid IXFR framing")
+
+    if _parse_soa_serial(packet.answers[0].rdata_decoded) != \
+    _parse_soa_serial(packet.answers[-1].rdata_decoded): raise Exception("IXFR must start and end with same SOA")
+    new_soa = packet.answers[0]
+    tokens = new_soa.rdata_decoded.split()
+    params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
+
+    old_soa = soas[new_soa.name]
+    soas[new_soa.name] = SOAData(new_soa, new_soa.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
+
+    raw_records, out = records[zone]
+
+    adding = True
+    for anwser in packet.answers:
+        match anwser.type:
+            case DNSType.SOA:
+                serial = _parse_soa_serial(anwser.rdata_decoded)
+                if serial == old_soa.serial: adding = False
+                elif serial == soas[new_soa.name].serial: adding = True
+            case _: 
+                if adding: 
+                    out.setdefault(anwser.name, []).append(anwser)
+                    raw_records.append(anwser)
+                else:
+                    x = out.setdefault(anwser.name, [])
+                    x[:] = [rc for rc in x if bytes(rc) != bytes(anwser)]
+                    out[anwser.name] = x
+
+                    raw_records[:] = [rc for rc in raw_records if bytes(rc) != bytes(anwser)]
+    records[zone] = (raw_records, out)
+
 def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
     def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
-    def delete_zone(zone):
-        try: del records[zone]
-        except: pass
 
     if soas.get(zone) and not soa_record:
         soa_packet = generate_packet()
@@ -96,22 +146,16 @@ def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
     print("Updating records for", zone)
     
     packet = generate_packet()
-    packet.add_question(DNSQuestion(zone, DNSType.AXFR, DNSClass.IN))
+
+    parse_method = parse_axfr
+    if (s := soas.get(zone)):
+        packet.add_question(DNSQuestion(zone, DNSType.IXFR, DNSClass.IN))
+        packet.add_authoritive_rr(s.record)
+        parse_method = parse_ixfr
+    else: packet.add_question(DNSQuestion(zone, DNSType.AXFR, DNSClass.IN))
     res = query_dns(packet, force_tcp=True)
     if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception
-    data_age = time.monotonic()
-    delete_zone(zone)
-
-    out = {}
-    for anwser in res.answers:
-        match anwser.type:
-            case DNSType.SOA:
-                tokens = anwser.rdata_decoded.split()
-                params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
-
-                soas[anwser.name] = SOAData(anwser, anwser.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
-            case _: out.setdefault(anwser.name, []).append(anwser)
-    records[zone] = (res.answers, out)
+    parse_method(res, zone)
 
 def fetch_records():
     for zone in args.zone: fetch_record(zone)

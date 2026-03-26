@@ -5,7 +5,7 @@ import configparser, argparse
 import hmac, hashlib, random
 from dataclasses import dataclass, field
 from lib.libcounter import Counter
-from server_base import DNSSocket, UDP, TCP, is_subdomain
+from server_base import DNSSocket, UDP, TCP, is_subdomain, _parse_soa_serial
 import threading
 
 def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
@@ -43,6 +43,7 @@ def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: floa
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
+MAX_JOURNAL_ENTRIES = 100
 
 parser = argparse.ArgumentParser()
 parser.add_argument("config", type=str, default="config.ini")
@@ -55,6 +56,32 @@ HOST = config.get("server", "host", fallback="0.0.0.0")
 PORT = config.getint("server", "port", fallback=53)
 TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
 REQUESTS_PER_SECOND = config.getint("server", "rps", fallback=75)
+
+
+@dataclass
+class JournalEntry:
+    old_soa_serial: int
+    new_soa_serial: int
+    additions: list[DNSAnswer]
+    deletions: list[DNSAnswer]
+
+soa_journal: dict[str, list[JournalEntry]] = {}
+
+def get_journal_chain(zone_name: str, from_serial: int, to_serial: int) -> list[JournalEntry] | None:
+    if from_serial == to_serial: return []
+
+    entries = soa_journal.get(zone_name, [])
+    entry_map: dict[int, JournalEntry] = {e.old_soa_serial: e for e in entries}
+
+    chain: list[JournalEntry] = []
+    current = from_serial
+    while current != to_serial:
+        entry = entry_map.get(current)
+        if entry is None: return None
+        chain.append(entry)
+        current = entry.new_soa_serial
+    return chain
+
 
 @dataclass
 class Zone:
@@ -102,11 +129,35 @@ class Zone:
         t = datetime.datetime.now()
         return (t.year * 1_000_000) + (t.month * 10_000) + (t.day * 100) + serial
 
+    def _diff_records(self, old_cache: dict, new_cache: dict) -> tuple[list, list]:
+        deletions: list = []
+        additions: list = []
+
+        for (name, qtype), (ttl, values) in old_cache.items():
+            new_entry = new_cache.get((name, qtype))
+            if new_entry is None: old_set = set(values)
+            else:
+                _, new_values = new_entry
+                old_set = set(values) - set(new_values)
+            for v in old_set:
+                deletions.append(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=v))
+
+        for (name, qtype), (ttl, values) in new_cache.items():
+            old_entry = old_cache.get((name, qtype))
+            if old_entry is None: new_set = set(values)
+            else:
+                _, old_values = old_entry
+                new_set = set(values) - set(old_values)
+            for v in new_set:
+                additions.append(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=v))
+
+        return additions, deletions
+
     def load(self):
         mtime = self.records_file.stat().st_mtime
         if self.records_mtime == mtime: return
 
-        records = {}
+        new_records = {}
         with open(self.records_file) as f:
             for line in f:
                 line = line.strip()
@@ -127,19 +178,39 @@ class Zone:
                     continue
 
                 key = (name, qtype)
-                if key not in records: records[key] = (int(ttl), [])
-                if records[key][0] < int(ttl):
+                if key not in new_records: new_records[key] = (int(ttl), [])
+                if new_records[key][0] < int(ttl):
                     print(f"[warn] mismatched TTL on {name}, using highest")
-                    records[key] = (int(ttl), records[key][1])
-                records[key][1].append(value)
+                    new_records[key] = (int(ttl), new_records[key][1])
+                new_records[key][1].append(value)
 
-        self.records_cache = records
+        old_cache = self.records_cache
+        if old_cache:
+            old_soa_serial = self.compute_soa_serial()
+            additions, deletions = self._diff_records(old_cache, new_records)
+
+            self.serial += 1
+            new_soa_serial = self.compute_soa_serial()
+
+            entry = JournalEntry(
+                old_soa_serial=old_soa_serial,
+                new_soa_serial=new_soa_serial,
+                additions=additions,
+                deletions=deletions,
+            )
+            journal = soa_journal.setdefault(self.name, [])
+            journal.append(entry)
+            # Cap journal size to avoid unbounded memory growth.
+            if len(journal) > MAX_JOURNAL_ENTRIES: del journal[: len(journal) - MAX_JOURNAL_ENTRIES]
+        else: self.serial += 1
+
+        self.records_cache = new_records
         self.records_mtime = mtime
-        self.serial += 1
 
         threading.Thread(target=self.notify_all_ns).run()
 
-        print(f"[info] [{self.name}] loaded {len(records)} record sets")
+        print(f"[info] [{self.name}] loaded {len(new_records)} record sets "
+              f"(serial={self.compute_soa_serial()})")
 
     def resolve(self, qname: str, qtype: DNSType, client_ip: bytes):
         qname = qname.rstrip(".") + "."
@@ -233,31 +304,73 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
         ns_ttl = zone.soa_cfg["ttl"]
 
-        def soa(add_func=out.add_answer, z=zone):
+        def soa(add_func=out.add_answer, z=zone, serial_override=None):
             email = z.soa_cfg["email"].replace("@", ".")
+            s = serial_override if serial_override is not None else z.compute_soa_serial()
             add_func(DNSAnswer(
                 z.name, DNSType.SOA, DNSClass.IN, z.soa_cfg["ttl"],
                 rdata_decoded=(
-                    f"{z.primary_ns}. {email}. serial={z.compute_soa_serial()} "
+                    f"{z.primary_ns}. {email}. serial={s} "
                     f"refresh={z.soa_cfg['refresh']} retry={z.soa_cfg['retry']} "
                     f"expire={z.soa_cfg['expire']} min={z.soa_cfg['min']}"
                 )
             ))
+        def afxr(z=zone):
+            if transport == TCP and z.axfr_allowed(client_ip):
+                soa()
+                for (name, qtype), (ttl, values) in z.records_cache.items():
+                    for value in values:
+                        out.add_answer(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=value))
+                for ns in z.ns_list:
+                    out.add_answer(DNSAnswer(z.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
+                soa()
+            else: out.header.flags.rcode = DNSRCode.REFUSED
 
         match question.qtype:
             case DNSType.SOA: soa()
             case DNSType.NS:
                 if qask == zone.name:
                     for ns in zone.ns_list: out.add_answer(DNSAnswer(zone.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
-            case DNSType.AXFR:
-                if transport == TCP and zone.axfr_allowed(client_ip):
+            case DNSType.AXFR: afxr()
+            case DNSType.IXFR:
+                if transport != TCP or not zone.axfr_allowed(client_ip):
+                    out.header.flags.rcode = DNSRCode.REFUSED
+                    continue
+
+                client_serial: int | None = None
+                for auth_rr in packet.authority:
+                    if auth_rr.type == DNSType.SOA:
+                        client_serial = _parse_soa_serial(auth_rr.rdata_decoded)
+                        break
+
+                current_serial = zone.compute_soa_serial()
+
+                if client_serial is None:
+                    print(f"[ixfr] [{zone.name}] no client serial, falling back to AXFR")
+                    afxr()
+                    continue
+
+                if client_serial == current_serial:
                     soa()
-                    for (name, qtype), (ttl, values) in zone.records_cache.items():
-                        for value in values:
-                            out.add_answer(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=value))
-                    for ns in zone.ns_list:
-                        out.add_answer(DNSAnswer(zone.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
-                    soa()
+                    continue
+
+                chain = get_journal_chain(zone.name, client_serial, current_serial)
+
+                if chain is None:
+                    # Journal doesn't cover the requested range — full AXFR fallback.
+                    print(f"[ixfr] [{zone.name}] journal gap from {client_serial} to {current_serial}, falling back to AXFR")
+                    afxr()
+                    continue
+                soa()  # opening new SOA
+                for entry in chain:
+                    soa(serial_override=entry.old_soa_serial)   # start of deletion set
+                    for rr in entry.deletions: out.add_answer(rr)
+                    soa(serial_override=entry.new_soa_serial)   # start of addition set
+                    for rr in entry.additions: out.add_answer(rr)
+                soa()
+
+                print(f"[ixfr] [{zone.name}] sent {len(chain)} delta(s) "
+                      f"from serial {client_serial} to {current_serial}")
             case _:
                 result, exists = zone.resolve(question.qname, question.qtype, client_ip)
 

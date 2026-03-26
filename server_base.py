@@ -7,6 +7,12 @@ def is_subdomain(sub: str, parent: str) -> bool:
     parent = parent.rstrip('.').lower()
     return sub == parent or sub.endswith('.' + parent)
 
+def _parse_soa_serial(rdata_decoded: str) -> int | None:
+    tokens = rdata_decoded.split()
+    params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
+    if (d := params.get("serial")): return int(d)
+    return None
+
 class Transport(IntEnum):
     UDP = 0
     TCP = 1
