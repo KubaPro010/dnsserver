@@ -94,12 +94,8 @@ class Zone:
                     f"expire={soa_cfg['expire']} min={soa_cfg['min']}"
                 )
             ))
-            def retry(i: int):
-                try: query_dns(packet, ns)
-                except Exception as e:
-                    print(f"Could not notify {ns} ({e})")
-                    if i < 2: retry(i+1)
-            retry(0)
+            try: query_dns(packet, ns)
+            except Exception as e: print(f"Could not notify {ns} ({e})")
 
     def compute_soa_serial(self, serial: int | None = None):
         if serial is None: serial = self.serial
