@@ -380,6 +380,6 @@ class PrimaryServer(DNSSocket):
     def handle(self, *args, **kwargs): return handle(*args, **kwargs)
     def _idle(self):
         load_all()
-        for ip, counter in ip_counts.items():
-            if counter.get_rate() < (REQUESTS_PER_SECOND / 2): del ip_counts[ip]
+        to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
+        for ip in to_delete: del ip_counts[ip]
 PrimaryServer(HOST, PORT, TCP_PORT, BUFFER_SIZE).run()

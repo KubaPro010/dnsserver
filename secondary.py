@@ -266,9 +266,9 @@ class SecondaryServer(DNSSocket):
     def _pre_run(self):
         fetch_records()
     def _idle(self):
-        for ip, counter in ip_counts.items():
-            if counter.get_rate() < (REQUESTS_PER_SECOND / 2): del ip_counts[ip]
-
+        to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
+        for ip in to_delete: del ip_counts[ip]
+        
         for soa_record, zone in to_fetch:
             try: fetch_record(zone, soa_record)
             except Exception: pass
