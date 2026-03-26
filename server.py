@@ -66,7 +66,6 @@ class Zone:
     serial: int = 0
     records_cache: dict = field(default_factory=dict)
     records_mtime: float | None = None
-    notify_thread: threading.Thread | None = None
 
     def axfr_allowed(self, client_ip: bytes) -> bool:
         if socket.inet_aton("127.0.0.1") == client_ip: return True
@@ -142,9 +141,7 @@ class Zone:
         self.records_mtime = mtime
         self.serial += 1
 
-        if self.notify_thread: self.notify_thread.join()
-        self.notify_thread = threading.Thread(target=self.notify_all_ns)
-        self.notify_thread.run()
+        threading.Thread(target=self.notify_all_ns).run()
 
         print(f"[info] [{self.name}] loaded {len(records)} record sets")
 
