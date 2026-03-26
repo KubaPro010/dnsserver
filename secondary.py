@@ -127,7 +127,7 @@ def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
         print("IFXR sent, serial:", s.serial)
     else: packet.add_question(DNSQuestion(zone, DNSType.AXFR, DNSClass.IN))
     res = query_dns(packet, force_tcp=True)
-    if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception
+    if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception(res.header.flags.rcode.name)
     parse_method(res, zone)
 
 def fetch_records():
@@ -263,7 +263,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
 class SecondaryServer(DNSSocket):
     def handle(self, *args, **kwargs): return handle(*args, **kwargs)
-    def _pre_run(self):
+    def _pre_run(self): 
         fetch_records()
     def _idle(self):
         to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
