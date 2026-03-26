@@ -249,11 +249,11 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             for record in rrs:
                 if record.name == this_zone: found_name = True
                 if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
+                if this_zone and is_subdomain(record.name, this_zone): found_name = True
 
                 if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
                     record.name = question.qname
                     out.add_answer(record)
-                    found_name = True
         recurse(zone_records.get(question.qname, []))
         if not found_name: recurse(find_wildcard(question.qname, this_zone, zone_records))
 
