@@ -152,6 +152,7 @@ def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
         packet.add_question(DNSQuestion(zone, DNSType.IXFR, DNSClass.IN))
         packet.add_authoritive_rr(s.record)
         parse_method = parse_ixfr
+        print("IFXR sent, serial:", s.serial)
     else: packet.add_question(DNSQuestion(zone, DNSType.AXFR, DNSClass.IN))
     res = query_dns(packet, force_tcp=True)
     if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception
@@ -197,7 +198,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 soa_record = aw
                 break
         if zone in soas and client_ip == socket.inet_aton(socket.gethostbyname(args.primary)):
-            print("Got notifed of change")
+            print(f"Got notifed of change ({zone})")
             to_fetch.append((soa_record, zone))
         packet.header.flags.qr = True
         return bytes(packet)

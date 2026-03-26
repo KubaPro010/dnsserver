@@ -212,7 +212,7 @@ class Zone:
         print(f"[info] [{self.name}] loaded {len(new_records)} record sets "
               f"(serial={self.compute_soa_serial()})")
 
-    def resolve(self, qname: str, qtype: DNSType, client_ip: bytes):
+    def resolve(self, qname: str, qtype: DNSType):
         qname = qname.rstrip(".") + "."
         result = self.records_cache.get((qname, qtype))
         if result: return result, True
@@ -370,12 +370,13 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 print(f"[ixfr] [{zone.name}] sent {len(chain)} delta(s) "
                       f"from serial {client_serial} to {current_serial}")
             case _:
-                result, exists = zone.resolve(question.qname, question.qtype, client_ip)
+                result, exists = zone.resolve(question.qname, question.qtype)
 
                 qtype_out = question.qtype
                 if not result and question.qtype != DNSType.CNAME and question.qtype in (DNSType.A, DNSType.AAAA):
-                    cname_result, cname_exists = zone.resolve(question.qname, DNSType.CNAME, client_ip)
+                    cname_result, cname_exists = zone.resolve(question.qname, DNSType.CNAME)
                     if cname_result: result, exists, qtype_out = cname_result, cname_exists, DNSType.CNAME
+                print(f"debug: {result} {exists} for {question.qname} {question.qtype.name} | {qtype_out}")
 
                 if result:
                     ttl, values = result
