@@ -127,6 +127,7 @@ class Zone:
         self.records_cache = records
         self.records_mtime = mtime
         self.serial += 1
+        self.notify_all_ns()
         print(f"[info] [{self.name}] loaded {len(records)} record sets")
 
     def resolve(self, qname: str, qtype: DNSType, client_ip: bytes):
