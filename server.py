@@ -216,6 +216,8 @@ class Zone:
         qname = qname.rstrip(".") + "."
         result = self.records_cache.get((qname, qtype))
         if result: return result, True
+        name_exists = any(k[0] == qname for k in self.records_cache)
+        if name_exists: return None, True
 
         labels = qname.rstrip(".").split(".")
         if len(labels) > 1:
@@ -223,8 +225,7 @@ class Zone:
             result = self.records_cache.get((wildcard, qtype))
             if result: return result, True
 
-        name_exists = any(k[0] == qname for k in self.records_cache)
-        return None, name_exists
+        return None, False
 
 zones: list[Zone] = []
 
@@ -376,7 +377,6 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 if not result and question.qtype != DNSType.CNAME and question.qtype in (DNSType.A, DNSType.AAAA):
                     cname_result, cname_exists = zone.resolve(question.qname, DNSType.CNAME)
                     if cname_result: result, exists, qtype_out = cname_result, cname_exists, DNSType.CNAME
-                print(f"debug: {result} {exists} for {question.qname} {question.qtype.name} | {qtype_out}")
 
                 if result:
                     ttl, values = result
