@@ -140,7 +140,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 best_len = len(zone)
         if not this_zone: continue
         soa = soas[this_zone]
-        soas_here.append(soa)
+        soas_here.append(soa.record)
         raw_zone_records, zone_records = records[this_zone]
 
         if time.monotonic() >= (soa.age + soa.expire):
