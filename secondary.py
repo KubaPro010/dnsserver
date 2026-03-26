@@ -74,12 +74,13 @@ soas: dict[str, SOAData] = {}
 
 records: dict[str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]] = {}
 
-def fetch_record(zone):
+def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
     def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
     def delete_zone(zone):
         try: del records[zone]
         except: pass
-    if soas.get(zone):
+
+    if soas.get(zone) and not soa_record:
         soa_packet = generate_packet()
         soa_packet.add_question(DNSQuestion(zone, DNSType.SOA, DNSClass.IN))
         soa_res = query_dns(soa_packet)
@@ -88,7 +89,12 @@ def fetch_record(zone):
             tokens = aw.rdata_decoded.split()
             params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
             if soas[zone].serial == int(params["serial"]): return # We have the same serial
-
+    elif soas.get(zone) and soa_record:
+        tokens = soa_record.rdata_decoded.split()
+        params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
+        if soas[zone].serial == int(params["serial"]): return # We have the same serial
+    print("Updating records for", zone)
+    
     packet = generate_packet()
     packet.add_question(DNSQuestion(zone, DNSType.AXFR, DNSClass.IN))
     res = query_dns(packet, force_tcp=True)
@@ -98,7 +104,7 @@ def fetch_record(zone):
 
     out = {}
     for anwser in res.answers:
-        match anwser.type: 
+        match anwser.type:
             case DNSType.SOA:
                 tokens = anwser.rdata_decoded.split()
                 params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
@@ -127,14 +133,29 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     if packet.header.flags.qr:
         out.header.flags.rcode = DNSRCode.REFUSED
         return bytes(out)
+
+    if packet.header.flags.opcode == DNSOPCode.NOTIFY:
+        zone = packet.questions[0].qname
+        soa_record = None
+        for aw in packet.answers:
+            if aw.type == DNSType.SOA:
+                soa_record = aw
+                break
+        if zone in soas and client_ip == socket.inet_aton(args.primary):
+            try: fetch_record(zone, soa_record)
+            except Exception: pass
+        packet.header.flags.qr = True
+        return bytes(packet)
     if packet.header.flags.opcode != DNSOPCode.QUERY:
         print("Unhandled opcode:", packet.header.flags.opcode)
         out.header.flags.rcode = DNSRCode.NOTIMP
         return bytes(out)
-    
+
     soas_here = []
-    found_name = False
+    all_nxdomain = True
+    any_found = False
     for question in packet.questions:
+        found_name = False
         this_zone = None
         best_len = -1
         for zone in records.keys():
@@ -163,7 +184,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             out.answers = raw_zone_records
             out.header.num_answers = len(out.answers)
             continue
-    
+
         for record in zone_records.get(question.qname, []):
             if record.name == this_zone: found_name = True
             if record.record_class != DNSClass.ANY and question.qclass != DNSClass.ANY and question.qclass != record.record_class: continue
@@ -171,16 +192,20 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             if record.type == question.qtype or (record.type != question.qtype and question.qtype in (DNSType.A, DNSType.AAAA) and record.type == DNSType.CNAME):
                 out.add_answer(record)
                 found_name = True
-    if found_name: 
+
+        if found_name:
+            all_nxdomain = False
+            any_found = True
+    if any_found:
         out.header.flags.rcode = DNSRCode.NOERROR
         if len(out.answers) == 0:
             out.authority += soas_here
             out.header.num_authority_rr += len(soas_here)
-    else:
+    elif all_nxdomain:
         out.header.flags.rcode = DNSRCode.NXDOMAIN
         out.authority += soas_here
         out.header.num_authority_rr += len(soas_here)
-   
+
     max_size = BUFFER_SIZE
     edns_options = []
     for additional in packet.additional:
@@ -193,10 +218,11 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                         edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
     out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
 
-    if transport == UDP and len(out) > max_size:
+    bout = bytes(out)
+    if transport == UDP and len(bout) > max_size:
         out.header.flags.tc = True
         return bytes(out)[:max_size]
-    return bytes(out)
+    return bout
 
 class SecondaryServer(DNSSocket):
     def handle(self, *args, **kwargs): return handle(*args, **kwargs)
@@ -206,6 +232,8 @@ class SecondaryServer(DNSSocket):
         ip_counts.clear()
         for soa in soas.values():
             if time.monotonic() >= soa.age + soa.refresh + soa.extra_time:
-                try: fetch_record(soa.zone)
+                try:
+                    fetch_record(soa.zone)
+                    soa.extra_time = 0
                 except Exception: soa.extra_time += soa.retry
 SecondaryServer(HOST, PORT, PORT, BUFFER_SIZE).run()

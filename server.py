@@ -5,7 +5,40 @@ import configparser, argparse
 import hmac, hashlib, random
 from dataclasses import dataclass, field
 from lib.libcounter import Counter
-from server_base import DNSSocket, UDP, TCP, is_subdomain  # reuse is_subdomain from secondary
+from server_base import DNSSocket, UDP, TCP, is_subdomain
+
+def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
+    packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
+    if not force_tcp:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.settimeout(timeout)
+        try:
+            udp.sendto(bytes(packet), (server_host, port))
+            data, _ = udp.recvfrom(BUFFER_SIZE)
+            response = DNSPacket.from_bytes(data)
+
+            if not response.header.flags.tc: return response
+        except Exception: pass
+        finally: udp.close()
+
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.settimeout(timeout)
+    try:
+        tcp.connect((server_host, port))
+        msg = bytes(packet)
+        tcp.sendall(struct.pack("!H", len(msg)) + msg)
+
+        raw_len = tcp.recv(2)
+        if len(raw_len) < 2: raise RuntimeError("Failed to read TCP response length")
+        msg_len = int.from_bytes(raw_len, "big")
+
+        data = b""
+        while len(data) < msg_len:
+            chunk = tcp.recv(msg_len - len(data))
+            if not chunk: raise RuntimeError("Incomplete TCP response")
+            data += chunk
+        return DNSPacket.from_bytes(data)
+    finally: tcp.close()
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
@@ -40,6 +73,21 @@ class Zone:
                 if socket.inet_aton(socket.gethostbyname(ns)) == client_ip: return True
             except OSError: pass
         return False
+
+    def notify_all_ns(self):
+        def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.NOTIFY, True, False, False, False, False, False, DNSRCode.NOERROR)))
+        for ns in self.ns_list:
+            packet = generate_packet().add_question(DNSQuestion(self.name, DNSType.SOA, DNSClass.IN))
+            email = self.soa_cfg["email"].replace("@", ".")
+            packet.add_answer(DNSAnswer(
+                self.name, DNSType.SOA, DNSClass.IN, self.soa_cfg["ttl"],
+                rdata_decoded=(
+                    f"{self.primary_ns}. {email}. serial={self.compute_soa_serial()} "
+                    f"refresh={self.soa_cfg['refresh']} retry={self.soa_cfg['retry']} "
+                    f"expire={self.soa_cfg['expire']} min={self.soa_cfg['min']}"
+                )
+            ))
+            query_dns(packet, ns)
 
     def compute_soa_serial(self):
         t = datetime.datetime.now()
@@ -100,8 +148,7 @@ class Zone:
 zones: list[Zone] = []
 
 for section in config.sections():
-    if not section.startswith("zone:"):
-        continue
+    if not section.startswith("zone:"): continue
     zone_name = section[len("zone:"):].rstrip(".") + "."
     sec = config[section]
     primary_ns = sec["primary_ns"]
@@ -229,10 +276,11 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                     ))
     out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
 
-    if transport == UDP and len(out) > max_size:
+    bout = bytes(out)
+    if transport == UDP and len(bout) > max_size:
         out.header.flags.tc = True
         return bytes(out)[:max_size]
-    return bytes(out)
+    return bout
 
 class PrimaryServer(DNSSocket):
     def _pre_run(self): load_all()

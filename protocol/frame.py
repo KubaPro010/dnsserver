@@ -308,7 +308,7 @@ class DNSPacket:
                 suffix = ".".join(parts[i:])
                 if suffix not in offset_map: offset_map[suffix] = pos
                 pos += 1 + len(parts[i].encode())
-            pos += 1 # TODO: check if neccessary
+            pos += 1
             out += bytes(q)
         for section in (self.answers, self.authority, self.additional):
             for record in section: out += record.to_bytes(offset_map, current_offset=len(out))
@@ -328,7 +328,7 @@ class DNSPacket:
 
     def clear(self):
         self.additional = []
-        self.answers = self.authority = []
+        self.answers, self.authority = [], []
         self.questions = []
         self.header.num_questions = self.header.num_authority_rr = self.header.num_answers = self.header.num_additional_rr = 0
         self.header.transaction_id += 1
