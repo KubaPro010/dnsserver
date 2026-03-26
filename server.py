@@ -174,7 +174,7 @@ class Zone:
         self.records_cache = new_records
         self.records_mtime = mtime
 
-        threading.Thread(target=self.notify_all_ns).run()
+        threading.Thread(target=self.notify_all_ns).start()
 
         print(f"[info] [{self.name}] loaded {len(new_records)} record sets "
               f"(serial={self.compute_soa_serial()})")
@@ -263,7 +263,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         out.add_question(question)
 
         zone = find_zone(question.qname)
-        if zone is None or not zone.records_cache:
+        if zone is None or zone.records_cache is None:
             out.header.flags.rcode = DNSRCode.REFUSED
             continue
         qask = question.qname.rstrip(".") + "."
