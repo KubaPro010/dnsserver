@@ -1,6 +1,6 @@
 import traceback, socket, select, struct
 from enum import IntEnum
-from protocol.frame import DNSPacket
+from protocol.frame import DNSPacket, EDNSOptRecord
 
 def is_subdomain(sub: str, parent: str) -> bool:
     sub = sub.rstrip('.').lower()
@@ -12,6 +12,39 @@ def _parse_soa_serial(rdata_decoded: str) -> int | None:
     params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
     if (d := params.get("serial")): return int(d)
     return None
+
+def query_dns(packet: DNSPacket, server_host: str, buffer_size: int, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
+    packet.add_additional_rr(EDNSOptRecord(False, buffer_size, []))
+    if not force_tcp:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.settimeout(timeout)
+        try:
+            udp.sendto(bytes(packet), (server_host, port))
+            data, _ = udp.recvfrom(buffer_size)
+            response = DNSPacket.from_bytes(data)
+
+            if not response.header.flags.tc: return response
+        except Exception: pass
+        finally: udp.close()
+
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.settimeout(timeout)
+    try:
+        tcp.connect((server_host, port))
+        msg = bytes(packet)
+        tcp.sendall(struct.pack("!H", len(msg)) + msg)
+
+        raw_len = tcp.recv(2)
+        if len(raw_len) < 2: raise RuntimeError("Failed to read TCP response length")
+        msg_len = int.from_bytes(raw_len, "big")
+
+        data = b""
+        while len(data) < msg_len:
+            chunk = tcp.recv(msg_len - len(data))
+            if not chunk: raise RuntimeError("Incomplete TCP response")
+            data += chunk
+        return DNSPacket.from_bytes(data)
+    finally: tcp.close()
 
 class Transport(IntEnum):
     UDP = 0

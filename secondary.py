@@ -6,6 +6,7 @@ import random
 from lib.libcounter import Counter
 import time
 from server_base import UDP, TCP, DNSSocket, is_subdomain, _parse_soa_serial
+from server_base import query_dns as _query_dns
 from dataclasses import dataclass
 
 BUFFER_SIZE = 1232
@@ -20,40 +21,8 @@ parser.add_argument("-r", "--rps", type=int, default=75)
 parser.add_argument("--zone", action="append")
 args = parser.parse_args()
 
-def query_dns(packet: DNSPacket, timeout: float = 5.0, force_tcp: bool = False) -> DNSPacket:
-    server_host = args.primary
-    port = args.primaryport
-    packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
-    if not force_tcp:
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp.settimeout(timeout)
-        try:
-            udp.sendto(bytes(packet), (server_host, port))
-            data, _ = udp.recvfrom(BUFFER_SIZE)
-            response = DNSPacket.from_bytes(data)
-
-            if not response.header.flags.tc: return response
-        except Exception: pass
-        finally: udp.close()
-
-    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp.settimeout(timeout)
-    try:
-        tcp.connect((server_host, port))
-        msg = bytes(packet)
-        tcp.sendall(struct.pack("!H", len(msg)) + msg)
-
-        raw_len = tcp.recv(2)
-        if len(raw_len) < 2: raise RuntimeError("Failed to read TCP response length")
-        msg_len = int.from_bytes(raw_len, "big")
-
-        data = b""
-        while len(data) < msg_len:
-            chunk = tcp.recv(msg_len - len(data))
-            if not chunk: raise RuntimeError("Incomplete TCP response")
-            data += chunk
-        return DNSPacket.from_bytes(data)
-    finally: tcp.close()
+def query_dns(packet: DNSPacket, *_args, **kwargs): 
+    return _query_dns(packet, args.primary, BUFFER_SIZE, *_args, **kwargs)
 
 HOST = args.host
 PORT = args.port
@@ -94,11 +63,14 @@ def parse_axfr(packet: DNSPacket, zone: str):
 
 def parse_ixfr(packet: DNSPacket, zone: str):
     data_age = time.monotonic()
-    if (packet.answers[0].type != DNSType.SOA or 
-        packet.answers[-1].type != DNSType.SOA): raise Exception("Invalid IXFR framing")
+    if (packet.answers[0].type != DNSType.SOA or packet.answers[-1].type != DNSType.SOA): raise Exception("Invalid IXFR framing")
 
-    if _parse_soa_serial(packet.answers[0].rdata_decoded) != \
-    _parse_soa_serial(packet.answers[-1].rdata_decoded): raise Exception("IXFR must start and end with same SOA")
+    if _parse_soa_serial(packet.answers[0].rdata_decoded) != _parse_soa_serial(packet.answers[-1].rdata_decoded): raise Exception("IXFR must start and end with same SOA")
+
+    if len(packet.answers) < 2 or packet.answers[1].type != DNSType.SOA:
+        print("Got AXFR instead, parsing that...")
+        return parse_axfr(packet, zone)
+
     new_soa = packet.answers[0]
     tokens = new_soa.rdata_decoded.split()
     params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
@@ -280,7 +252,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             for option in additional.options:
                 match option.code:
                     case EDNSOptionCode.COOKIE:
-                        edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()))
+                        edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.digest(EDNS_SECRET, option.data + client_ip, hashlib.md5)))
     out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
 
     bout = bytes(out)
@@ -294,7 +266,9 @@ class SecondaryServer(DNSSocket):
     def _pre_run(self):
         fetch_records()
     def _idle(self):
-        ip_counts.clear()
+        for ip, counter in ip_counts.items():
+            if counter.get_rate() < (REQUESTS_PER_SECOND / 2): del ip_counts[ip]
+
         for soa_record, zone in to_fetch:
             try: fetch_record(zone, soa_record)
             except Exception: pass

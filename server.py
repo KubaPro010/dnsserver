@@ -5,41 +5,8 @@ import configparser, argparse
 import hmac, hashlib, random
 from dataclasses import dataclass, field
 from lib.libcounter import Counter
-from server_base import DNSSocket, UDP, TCP, is_subdomain, _parse_soa_serial
+from server_base import DNSSocket, UDP, TCP, is_subdomain, _parse_soa_serial, query_dns
 import threading
-
-def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
-    packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
-    if not force_tcp:
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp.settimeout(timeout)
-        try:
-            udp.sendto(bytes(packet), (server_host, port))
-            data, _ = udp.recvfrom(BUFFER_SIZE)
-            response = DNSPacket.from_bytes(data)
-
-            if not response.header.flags.tc: return response
-        except Exception: pass
-        finally: udp.close()
-
-    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp.settimeout(timeout)
-    try:
-        tcp.connect((server_host, port))
-        msg = bytes(packet)
-        tcp.sendall(struct.pack("!H", len(msg)) + msg)
-
-        raw_len = tcp.recv(2)
-        if len(raw_len) < 2: raise RuntimeError("Failed to read TCP response length")
-        msg_len = int.from_bytes(raw_len, "big")
-
-        data = b""
-        while len(data) < msg_len:
-            chunk = tcp.recv(msg_len - len(data))
-            if not chunk: raise RuntimeError("Incomplete TCP response")
-            data += chunk
-        return DNSPacket.from_bytes(data)
-    finally: tcp.close()
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
@@ -121,7 +88,7 @@ class Zone:
                     f"expire={soa_cfg['expire']} min={soa_cfg['min']}"
                 )
             ))
-            try: query_dns(packet, ns)
+            try: query_dns(packet, ns, BUFFER_SIZE)
             except Exception as e: print(f"Could not notify {ns} ({e})")
 
     def compute_soa_serial(self, serial: int | None = None):
@@ -398,7 +365,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 if option.code == EDNSOptionCode.COOKIE:
                     edns_options.append(EDNSOption(
                         EDNSOptionCode.COOKIE,
-                        option.data + hmac.new(EDNS_SECRET, option.data + client_ip, hashlib.md5).digest()
+                        option.data + hmac.digest(EDNS_SECRET, option.data + client_ip, hashlib.md5)
                     ))
     out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
 
@@ -413,5 +380,6 @@ class PrimaryServer(DNSSocket):
     def handle(self, *args, **kwargs): return handle(*args, **kwargs)
     def _idle(self):
         load_all()
-        ip_counts.clear()
+        for ip, counter in ip_counts.items():
+            if counter.get_rate() < (REQUESTS_PER_SECOND / 2): del ip_counts[ip]
 PrimaryServer(HOST, PORT, TCP_PORT, BUFFER_SIZE).run()
