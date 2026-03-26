@@ -116,6 +116,8 @@ def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
 def fetch_records():
     for zone in args.zone: fetch_record(zone)
 
+to_fetch: list[tuple[DNSAnswer | None, str]] = []
+
 ip_counts: dict[bytes, Counter] = {}
 
 def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
@@ -142,8 +144,8 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 soa_record = aw
                 break
         if zone in soas and client_ip == socket.inet_aton(socket.gethostbyname(args.primary)):
-            try: fetch_record(zone, soa_record)
-            except Exception: pass
+            print("Got notifed of change")
+            to_fetch.append((soa_record, zone))
         packet.header.flags.qr = True
         return bytes(packet)
     if packet.header.flags.opcode != DNSOPCode.QUERY:
@@ -230,6 +232,11 @@ class SecondaryServer(DNSSocket):
         fetch_records()
     def _idle(self):
         ip_counts.clear()
+        for soa_record, zone in to_fetch:
+            try: fetch_record(zone, soa_record)
+            except Exception: pass
+        to_fetch.clear()
+        
         for soa in soas.values():
             if time.monotonic() >= soa.age + soa.refresh + soa.extra_time:
                 try:

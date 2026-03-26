@@ -8,7 +8,7 @@ from lib.libcounter import Counter
 from server_base import DNSSocket, UDP, TCP, is_subdomain
 import threading
 
-def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 3.0, force_tcp: bool = False) -> DNSPacket:
+def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
     packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
     if not force_tcp:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
