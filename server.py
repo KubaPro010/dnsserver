@@ -84,6 +84,16 @@ class Zone:
                 if socket.inet_aton(socket.gethostbyname(ns)) == client_ip: return True
             except OSError: pass
         return False
+    
+    def save(self):
+        lines = []
+        for (name, qtype), (ttl, values) in self.records_cache.items():
+            # Normalise name back to relative form for readability (optional)
+            for value in values:
+                lines.append(f"{qtype.name}\t{name}\t{ttl}\t{value}\n")
+        tmp = self.records_file.with_suffix(".tmp")
+        tmp.write_text("".join(lines))
+        tmp.replace(self.records_file)  # atomic on POSIX
 
     def notify_all_ns(self):
         def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.NOTIFY, True, False, False, False, False, False, DNSRCode.NOERROR)))
@@ -121,8 +131,7 @@ class Zone:
             else:
                 _, new_values = new_entry
                 old_set = set(values) - set(new_values)
-            for v in old_set:
-                deletions.append(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=v))
+            for v in old_set: deletions.append(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=v))
 
         for (name, qtype), (ttl, values) in new_cache.items():
             old_entry = old_cache.get((name, qtype))
@@ -130,8 +139,7 @@ class Zone:
             else:
                 _, old_values = old_entry
                 new_set = set(values) - set(old_values)
-            for v in new_set:
-                additions.append(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=v))
+            for v in new_set: additions.append(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=v))
 
         return additions, deletions
 
@@ -174,15 +182,9 @@ class Zone:
             self.serial += 1
             new_soa_serial = self.compute_soa_serial()
 
-            entry = JournalEntry(
-                old_soa_serial=old_soa_serial,
-                new_soa_serial=new_soa_serial,
-                additions=additions,
-                deletions=deletions,
-            )
+            entry = JournalEntry(old_soa_serial=old_soa_serial, new_soa_serial=new_soa_serial, additions=additions, deletions=deletions)
             journal = soa_journal.setdefault(self.name, [])
             journal.append(entry)
-            # Cap journal size to avoid unbounded memory growth.
             if len(journal) > MAX_JOURNAL_ENTRIES: del journal[: len(journal) - MAX_JOURNAL_ENTRIES]
         else: self.serial += 1
 
@@ -395,6 +397,7 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
             del journal[:len(journal) - MAX_JOURNAL_ENTRIES]
 
         zone.records_cache = new_cache
+        zone.save()
         threading.Thread(target=zone.notify_all_ns).start()
         print(f"[update] [{zone.name}] +{len(additions)}/-{len(deletions)} RRs "
               f"(serial {old_soa_serial} → {new_soa_serial})")
