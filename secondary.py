@@ -75,18 +75,14 @@ def parse_ixfr(packet: DNSPacket, zone: str):
     tokens = new_soa.rdata_decoded.split()
     params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
 
-    old_soa = soas[new_soa.name]
     soas[new_soa.name] = SOAData(new_soa, new_soa.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
 
     raw_records, out = records[zone]
 
-    adding = True
-    for anwser in packet.answers:
+    adding = False
+    for anwser in packet.answers[1:]:
         match anwser.type:
-            case DNSType.SOA:
-                serial = _parse_soa_serial(anwser.rdata_decoded)
-                if serial == old_soa.serial: adding = False
-                elif serial == soas[new_soa.name].serial: adding = True
+            case DNSType.SOA: adding = not adding
             case _: 
                 if adding: 
                     out.setdefault(anwser.name, []).append(anwser)
