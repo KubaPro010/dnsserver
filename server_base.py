@@ -89,7 +89,7 @@ class DNSSocket:
             self._pre_run()
             while True:
                 try:
-                    readable, _, _ = select.select([udp, tcp], [], [], 10)
+                    readable, _, _ = select.select([udp, tcp], [], [], 2)
                     for sock in readable:
                         if sock is udp:
                             data, addr = udp.recvfrom(self.buffer_size)

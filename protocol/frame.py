@@ -2,6 +2,130 @@ import struct, socket
 from dataclasses import dataclass, field
 from protocol.const import *
 from protocol.decode import decode_rdata, decode_name
+from enum import StrEnum
+import hmac
+import time as _time
+
+class TSIGAlgorithm(StrEnum):
+    HMAC_MD5 = "hmac-md5.sig-alg.reg.int"
+    HMAC_SHA1 = "hmac-sha1"
+    HMAC_SHA256 = "hmac-sha256"
+    HMAC_SHA384 = "hmac-sha384"
+    HMAC_SHA512 = "hmac-sha512"
+
+    def digest(self) -> str:
+        return {
+            TSIGAlgorithm.HMAC_MD5: "md5", TSIGAlgorithm.HMAC_SHA1: "sha1",
+            TSIGAlgorithm.HMAC_SHA256: "sha256", TSIGAlgorithm.HMAC_SHA384: "sha384",
+            TSIGAlgorithm.HMAC_SHA512: "sha512"}[self]
+
+class TSIGError(Exception): ...
+
+def _decode_name_uncompressed(data: bytes, offset: int) -> tuple[str, int]:
+    labels = []
+    while True:
+        length = data[offset]; offset += 1
+        if length == 0: break
+        if length & 0xC0: raise TSIGError("Compressed names are not allowed inside TSIG rdata")
+        labels.append(data[offset:offset + length].decode())
+        offset += length
+    return ".".join(labels), offset
+
+@dataclass
+class TSIGRecord:
+    key_name: str
+    algorithm: TSIGAlgorithm
+    time_signed: int
+    fudge: int
+    mac: bytes
+    original_id: int
+    error: int = 0
+    other_data: bytes = b""
+
+    def _rdata_bytes(self) -> bytes:
+        out  = encode_name(self.algorithm.value)
+        out += struct.pack("!HI", (self.time_signed >> 32) & 0xFFFF, self.time_signed & 0xFFFFFFFF)
+        out += struct.pack("!HH", self.fudge, len(self.mac))
+        out += self.mac
+        out += struct.pack("!HHH", self.original_id, self.error, len(self.other_data))
+        out += self.other_data
+        return out
+
+    def to_bytes(self, *_, **__) -> bytes:
+        rdata = self._rdata_bytes()
+        return (
+            encode_name(self.key_name)
+            + struct.pack("!HHIH", DNSType.TSIG, DNSClass.ANY, 0, len(rdata)) + rdata
+        )
+
+    @staticmethod
+    def from_answer(answer: "DNSAnswer") -> "TSIGRecord":
+        d = answer.rdata
+        offset = 0
+
+        algo_name, offset = _decode_name_uncompressed(d, offset)
+        algorithm = TSIGAlgorithm(algo_name.rstrip("."))
+
+        time_high, time_low = struct.unpack_from("!HI", d, offset)
+        time_signed = (time_high << 32) | time_low
+        offset += 6
+
+        fudge, mac_size = struct.unpack_from("!HH", d, offset); offset += 4
+        mac = d[offset:offset + mac_size]
+        offset += mac_size
+
+        original_id, error, other_len = struct.unpack_from("!HHH", d, offset); offset += 6
+        other_data = d[offset:offset + other_len]
+
+        return TSIGRecord(
+            key_name=answer.name,
+            algorithm=algorithm,
+            time_signed=time_signed,
+            fudge=fudge,
+            mac=mac,
+            original_id=original_id,
+            error=error,
+            other_data=other_data,
+        )
+
+    @staticmethod
+    def _signed_data(message: bytes, key_name: str,
+        algorithm: "TSIGAlgorithm", time_signed: int,
+        fudge: int, error: int = 0,
+        other_data: bytes = b"", request_mac: bytes = b"") -> bytes:
+        buf = b""
+        if request_mac: buf += struct.pack("!H", len(request_mac)) + request_mac
+        buf += message
+        buf += encode_name(key_name)
+        buf += struct.pack("!HI", DNSClass.ANY, 0)
+        buf += encode_name(algorithm.value)
+        buf += struct.pack("!HI", (time_signed >> 32) & 0xFFFF,
+                           time_signed & 0xFFFFFFFF)
+        buf += struct.pack("!HHH", fudge, error, len(other_data))
+        buf += other_data
+        return buf
+
+    @classmethod
+    def sign(cls,
+        message: bytes, key_name: str,
+        key: bytes, algorithm: "TSIGAlgorithm" = TSIGAlgorithm.HMAC_SHA256,
+        fudge: int = 300, original_id: int | None = None,
+        request_mac: bytes = b"", error: int = 0,
+        other_data: bytes = b"") -> "TSIGRecord":
+        now = int(_time.time())
+        if original_id is None: original_id = struct.unpack_from("!H", message, 0)[0]
+        data = cls._signed_data(message, key_name, algorithm, now, fudge, error, other_data, request_mac)
+        mac = hmac.new(key, data, algorithm.digest()).digest()
+        return cls(key_name=key_name, algorithm=algorithm, time_signed=now,
+                   fudge=fudge, mac=mac, original_id=original_id, # type: ignore
+                   error=error, other_data=other_data)
+
+    def verify(self, message: bytes, key: bytes, request_mac: bytes = b"") -> None:
+        skew = abs(int(_time.time()) - self.time_signed)
+        if skew > self.fudge: raise TSIGError(f"TSIG clock skew too large: {skew}s > {self.fudge}s")
+        data = self._signed_data(message, self.key_name, self.algorithm, self.time_signed, self.fudge, self.error, self.other_data, request_mac)
+        expected = hmac.new(key, data, self.algorithm.digest()).digest()
+        if not hmac.compare_digest(expected, self.mac): raise TSIGError("TSIG MAC mismatch")
 
 @dataclass
 class EDNSOption:
@@ -276,10 +400,10 @@ class DNSAnswer:
 @dataclass
 class DNSPacket:
     header: DNSHeader
-    questions: list[DNSQuestion] = field(default_factory=list)
-    answers: list[DNSAnswer] = field(default_factory=list)
-    authority: list[DNSAnswer] = field(default_factory=list)
-    additional: list[DNSAnswer | EDNSOptRecord] = field(default_factory=list)
+    questions: list[DNSQuestion] = field(default_factory=list) # Zone on update
+    answers: list[DNSAnswer] = field(default_factory=list) # Prerequisite
+    authority: list[DNSAnswer] = field(default_factory=list) # Update
+    additional: list[DNSAnswer | EDNSOptRecord | TSIGRecord] = field(default_factory=list)
 
     def add_question(self, question: DNSQuestion):
         self.header.num_questions += 1
@@ -289,7 +413,7 @@ class DNSPacket:
         self.header.num_answers += 1
         self.answers.append(answer)
         return self
-    def add_additional_rr(self, answer: DNSAnswer | EDNSOptRecord):
+    def add_additional_rr(self, answer: DNSAnswer | EDNSOptRecord | TSIGRecord):
         self.header.num_additional_rr += 1
         self.additional.append(answer)
         return self
@@ -297,6 +421,42 @@ class DNSPacket:
         self.header.num_authority_rr += 1
         self.authority.append(answer)
         return self
+
+    def sign_tsig(self, key_name: str,
+        key: bytes, algorithm: TSIGAlgorithm = TSIGAlgorithm.HMAC_SHA256,
+        fudge: int = 300, request_mac: bytes = b"") -> "DNSPacket":
+        tsig = TSIGRecord.sign(
+            message=bytes(self),
+            key_name=key_name,
+            key=key,
+            algorithm=algorithm,
+            fudge=fudge,
+            original_id=self.header.transaction_id,
+            request_mac=request_mac,
+        )
+        return self.add_additional_rr(tsig)
+
+    def verify_tsig(self, keys: dict[str, bytes],
+        request_mac: bytes = b"") -> TSIGRecord:
+        tsig_idx, tsig_rec = next(
+            ((i, rr) for i, rr in enumerate(self.additional)
+             if isinstance(rr, TSIGRecord)),
+            (None, None),
+        )
+        if tsig_idx is None or tsig_rec is None: raise TSIGError("No TSIG record in additional section")
+
+        key = keys.get(tsig_rec.key_name)
+        if key is None: raise TSIGError(f"Unknown TSIG key: {tsig_rec.key_name!r}")
+
+        self.additional.pop(tsig_idx)
+        self.header.num_additional_rr -= 1
+        try: raw = bytes(self)
+        finally:
+            self.additional.insert(tsig_idx, tsig_rec)
+            self.header.num_additional_rr += 1
+
+        tsig_rec.verify(raw, key, request_mac)
+        return tsig_rec
 
     def __bytes__(self):
         offset_map = {}
@@ -353,10 +513,12 @@ class DNSPacket:
             packet.authority.append(a)
 
         for _ in range(header.num_additional_rr):
-            a, old_offset = DNSAnswer.from_bytes(data, offset)
-            if a.type == DNSType.OPT: a, offset = EDNSOptRecord.from_bytes(data, offset)
-            else: offset = old_offset
-            packet.additional.append(a)
+            a, offset = DNSAnswer.from_bytes(data, offset)
+            if a.type == DNSType.OPT:
+                edns, offset = EDNSOptRecord.from_bytes(data, offset - len(bytes(a)))
+                packet.additional.append(edns)
+            elif a.type == DNSType.TSIG: packet.additional.append(TSIGRecord.from_answer(a))
+            else: packet.additional.append(a)
 
         return packet
 

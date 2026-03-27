@@ -2,11 +2,11 @@ from protocol.frame import *
 import socket
 import pathlib, datetime
 import configparser, argparse
-import hmac, hashlib, random
+import hmac, hashlib, random, base64
 from dataclasses import dataclass, field
 from lib.libcounter import Counter
 from server_base import DNSSocket, UDP, TCP, is_subdomain, _parse_soa_serial, query_dns
-import threading
+import threading, time
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
@@ -24,6 +24,15 @@ PORT = config.getint("server", "port", fallback=53)
 TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
 REQUESTS_PER_SECOND = config.getint("server", "rps", fallback=75)
 
+tsig_keys: dict[str, tuple[bytes, TSIGAlgorithm]] = {}
+
+for section in config.sections():
+    if not section.startswith("tsig:"): continue
+    key_name = section[len("tsig:"):]
+    sec = config[section]
+    secret = base64.b64decode(sec["secret"])
+    algorithm = TSIGAlgorithm(sec.get("algorithm", TSIGAlgorithm.HMAC_SHA256))
+    tsig_keys[key_name] = (secret, algorithm)
 
 @dataclass
 class JournalEntry:
@@ -49,7 +58,6 @@ def get_journal_chain(zone_name: str, from_serial: int, to_serial: int) -> list[
         current = entry.new_soa_serial
     return chain
 
-
 @dataclass
 class Zone:
     name: str
@@ -58,8 +66,16 @@ class Zone:
     ns_list: list[str]
     soa_cfg: dict
     serial: int = 0
-    records_cache: dict = field(default_factory=dict)
+    records_cache: dict[tuple[str, DNSType], tuple[int, list[str]]] = field(default_factory=dict)
+    "Format is (name, type): (ttl, [values])"
+
     records_mtime: float | None = None
+    update_tsig_keys: list[str] = field(default_factory=list)
+    axfr_tsig_keys: list[str] = field(default_factory=list)
+
+    def update_allowed_tsig(self, key_name: str) -> bool: return key_name in self.update_tsig_keys
+
+    def axfr_allowed_tsig(self, key_name: str) -> bool: return key_name in self.axfr_tsig_keys
 
     def axfr_allowed(self, client_ip: bytes) -> bool:
         if socket.inet_aton("127.0.0.1") == client_ip: return True
@@ -75,19 +91,18 @@ class Zone:
         soa_cfg = self.soa_cfg
         serial = self.serial
         name = self.name
+        packet = generate_packet().add_question(DNSQuestion(name, DNSType.SOA, DNSClass.IN))
+        email = soa_cfg["email"].replace("@", ".")
+        packet.add_answer(DNSAnswer(
+            name, DNSType.SOA, DNSClass.IN, soa_cfg["ttl"],
+            rdata_decoded=(
+                f"{primary_ns}. {email}. serial={self.compute_soa_serial(serial)} "
+                f"refresh={soa_cfg['refresh']} retry={soa_cfg['retry']} "
+                f"expire={soa_cfg['expire']} min={soa_cfg['min']}"
+            )
+        ))
         for ns in self.ns_list[:]:
             if ns == primary_ns: continue
-
-            packet = generate_packet().add_question(DNSQuestion(name, DNSType.SOA, DNSClass.IN))
-            email = soa_cfg["email"].replace("@", ".")
-            packet.add_answer(DNSAnswer(
-                name, DNSType.SOA, DNSClass.IN, soa_cfg["ttl"],
-                rdata_decoded=(
-                    f"{primary_ns}. {email}. serial={self.compute_soa_serial(serial)} "
-                    f"refresh={soa_cfg['refresh']} retry={soa_cfg['retry']} "
-                    f"expire={soa_cfg['expire']} min={soa_cfg['min']}"
-                )
-            ))
             try: query_dns(packet, ns, BUFFER_SIZE)
             except Exception as e: print(f"Could not notify {ns} ({e})")
 
@@ -216,6 +231,8 @@ for section in config.sections():
             "min": sec.getint("min", 3600),
         },
         serial=sec.getint("serial", 0),
+        update_tsig_keys=[k.strip() for k in sec.get("update_tsig_keys", "").split(",") if k.strip()],
+        axfr_tsig_keys=[k.strip() for k in sec.get("axfr_tsig_keys", "").split(",") if k.strip()],
     ))
 
 if not zones: raise RuntimeError("No [zone:*] sections found in config")
@@ -236,35 +253,187 @@ def load_all():
         except Exception as e:
             print(f"[error] loading zone {z.name}: {e}")
 
+last_ip_clear = 0
 ip_counts: dict[bytes, Counter] = {}
 
-def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
+def verify_request_tsig(packet: DNSPacket) -> tuple[TSIGRecord, bytes] | None:
+    has_tsig = any(isinstance(rr, TSIGRecord) for rr in packet.additional)
+    if not has_tsig: return None
+    keys_bytes = {name: secret for name, (secret, _) in tsig_keys.items()}
+    tsig_rec = packet.verify_tsig(keys_bytes)
+    secret, _ = tsig_keys[tsig_rec.key_name]
+    return tsig_rec, secret
+
+def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNSPacket, tuple[TSIGRecord, bytes] | None]:
+    is_localhost = (client_ip == socket.inet_aton("127.0.0.1"))
+
+    tsig_info: tuple[TSIGRecord, bytes] | None = None
+    try:
+        tsig_info = verify_request_tsig(packet)
+    except TSIGError as e:
+        print(f"[tsig] UPDATE rejected: {e}")
+        out_packet.header.flags.rcode = DNSRCode.REFUSED
+        return out_packet, None
+
+    # Must be localhost OR carry a valid TSIG (zone check comes later)
+    if not is_localhost and tsig_info is None:
+        out_packet.header.flags.rcode = DNSRCode.REFUSED
+        return out_packet, None
+
+    if packet.header.num_questions != 1 or packet.questions[0].qtype != DNSType.SOA:
+        out_packet.header.flags.rcode = DNSRCode.FORMERR
+        return out_packet, None
+
+    raw_zone = packet.questions[0].qname
+    zone = find_zone(raw_zone)
+    if zone is None or zone.records_cache is None:
+        out_packet.header.flags.rcode = DNSRCode.NOTZONE
+        return out_packet, None
+
+    if not is_localhost:
+        assert tsig_info is not None
+        tsig_rec, _ = tsig_info
+        if not zone.update_allowed_tsig(tsig_rec.key_name):
+            print(f"[tsig] UPDATE key {tsig_rec.key_name!r} not authorised for {zone.name}")
+            out_packet.header.flags.rcode = DNSRCode.REFUSED
+            return out_packet, None
+
+    for prereq in packet.answers:
+        normalized = prereq.name.rstrip(".") + "."
+
+        if not is_subdomain(normalized, zone.name):
+            out_packet.header.flags.rcode = DNSRCode.NOTZONE
+            return out_packet, None
+
+        no_rdata = len(prereq.rdata) == 0
+
+        if prereq.record_class == DNSClass.ANY and no_rdata:
+            if prereq.type == DNSType.ANY:
+                if not any(k[0] == normalized for k in zone.records_cache):
+                    out_packet.header.flags.rcode = DNSRCode.NXDOMAIN
+                    return out_packet, None
+            else:
+                if not zone.records_cache.get((normalized, prereq.type)):
+                    out_packet.header.flags.rcode = DNSRCode.NXRRSET
+                    return out_packet, None
+
+        elif prereq.record_class == DNSClass.NONE and no_rdata:
+            if prereq.type == DNSType.ANY:
+                if any(k[0] == normalized for k in zone.records_cache):
+                    out_packet.header.flags.rcode = DNSRCode.YXDOMAIN
+                    return out_packet, None
+            else:
+                if zone.records_cache.get((normalized, prereq.type)):
+                    out_packet.header.flags.rcode = DNSRCode.YXRRSET
+                    return out_packet, None
+
+        elif prereq.record_class == DNSClass.IN and not no_rdata:
+            r = zone.records_cache.get((normalized, prereq.type))
+            if not r or prereq.rdata_decoded not in r[1]:
+                out_packet.header.flags.rcode = DNSRCode.NXRRSET
+                return out_packet, None
+        else:
+            out_packet.header.flags.rcode = DNSRCode.FORMERR
+            return out_packet, None
+
+    new_cache: dict = {k: (ttl, list(vals)) for k, (ttl, vals) in zone.records_cache.items()}
+
+    for upd in packet.authority:
+        normalized = upd.name.rstrip(".") + "."
+
+        if not is_subdomain(normalized, zone.name):
+            out_packet.header.flags.rcode = DNSRCode.NOTZONE
+            return out_packet, None
+
+        is_apex = normalized == zone.name
+        no_rdata = len(upd.rdata) == 0
+
+        if upd.record_class == DNSClass.IN and not no_rdata:
+            key = (normalized, upd.type)
+            ttl, values = new_cache.get(key, (upd.ttl, []))
+            if upd.rdata_decoded not in values: values = values + [upd.rdata_decoded]
+            new_cache[key] = (ttl, values)
+
+        elif upd.record_class == DNSClass.ANY and no_rdata:
+            if upd.type == DNSType.ANY:
+                protected = {DNSType.SOA, DNSType.NS} if is_apex else set()
+                for k in [k for k in new_cache if k[0] == normalized and k[1] not in protected]: del new_cache[k]
+            else:
+                if is_apex and upd.type in (DNSType.SOA, DNSType.NS): pass
+                else: new_cache.pop((normalized, upd.type), None)
+
+        elif upd.record_class == DNSClass.NONE and not no_rdata:
+            if is_apex and upd.type in (DNSType.SOA, DNSType.NS): pass
+            else:
+                key = (normalized, upd.type)
+                if key in new_cache:
+                    ttl, values = new_cache[key]
+                    values = [v for v in values if v != upd.rdata_decoded]
+                    if values: new_cache[key] = (ttl, values)
+                    else: del new_cache[key]
+
+        else:
+            out_packet.header.flags.rcode = DNSRCode.FORMERR
+            return out_packet, None
+
+    additions, deletions = zone._diff_records(zone.records_cache, new_cache)
+
+    if additions or deletions:
+        old_soa_serial = zone.compute_soa_serial()
+        zone.serial += 1
+        new_soa_serial = zone.compute_soa_serial()
+
+        entry = JournalEntry(
+            old_soa_serial=old_soa_serial,
+            new_soa_serial=new_soa_serial,
+            additions=additions,
+            deletions=deletions,
+        )
+        journal = soa_journal.setdefault(zone.name, [])
+        journal.append(entry)
+        if len(journal) > MAX_JOURNAL_ENTRIES:
+            del journal[:len(journal) - MAX_JOURNAL_ENTRIES]
+
+        zone.records_cache = new_cache
+        threading.Thread(target=zone.notify_all_ns).start()
+        print(f"[update] [{zone.name}] +{len(additions)}/-{len(deletions)} RRs "
+              f"(serial {old_soa_serial} → {new_soa_serial})")
+
+    return out_packet, tsig_info
+
+def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNSPacket, tuple[TSIGRecord, bytes] | None]:
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id,
-        DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
+        DNSHeader_Flags(True, packet.header.flags.opcode, True, False, True, False, False, False, DNSRCode.NOERROR)
     ))
+    tsig_info: tuple[TSIGRecord, bytes] | None = None
 
     if (c := ip_counts.get(client_ip)):
         c.beat()
         if c.get_rate() > REQUESTS_PER_SECOND:
             out.header.flags.rcode = DNSRCode.REFUSED
-            return bytes(out)
+            return out, tsig_info
     else: ip_counts[client_ip] = Counter().beat()
 
     if packet.header.flags.qr:
         out.header.flags.rcode = DNSRCode.REFUSED
-        return bytes(out)
+        return out, tsig_info
+    if packet.header.flags.opcode == DNSOPCode.UPDATE: 
+        try: return handle_update(packet, out, client_ip, transport)
+        except ConnectionRefusedError:
+            out.header.flags.rcode = DNSRCode.NOTIMP
+            return out, tsig_info
     if packet.header.flags.opcode != DNSOPCode.QUERY:
         print("Unhandled opcode:", packet.header.flags.opcode)
         out.header.flags.rcode = DNSRCode.NOTIMP
-        return bytes(out)
+        return out, tsig_info
 
     for question in packet.questions:
         out.add_question(question)
 
         zone = find_zone(question.qname)
         if zone is None or zone.records_cache is None:
-            out.header.flags.rcode = DNSRCode.REFUSED
+            out.header.flags.rcode = DNSRCode.NOTZONE
             continue
         qask = question.qname.rstrip(".") + "."
 
@@ -282,24 +451,61 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 )
             ))
         def afxr(z=zone):
-            if transport == TCP and z.axfr_allowed(client_ip):
-                soa()
-                for (name, qtype), (ttl, values) in z.records_cache.items():
-                    for value in values:
-                        out.add_answer(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=value))
-                for ns in z.ns_list:
-                    out.add_answer(DNSAnswer(z.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
-                soa()
-            else: out.header.flags.rcode = DNSRCode.REFUSED
+            soa()
+            for (name, qtype), (ttl, values) in z.records_cache.items():
+                for value in values:
+                    out.add_answer(DNSAnswer(name, qtype, DNSClass.IN, ttl, rdata_decoded=value))
+            for ns in z.ns_list:
+                out.add_answer(DNSAnswer(z.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
+            soa()
 
         match question.qtype:
             case DNSType.SOA: soa()
             case DNSType.NS:
                 if qask == zone.name:
                     for ns in zone.ns_list: out.add_answer(DNSAnswer(zone.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
-            case DNSType.AXFR: afxr()
+            case DNSType.AXFR: 
+                if transport != TCP:
+                    out.header.flags.rcode = DNSRCode.REFUSED
+                    continue
+
+                axfr_tsig_info = None
+                try:
+                    axfr_tsig_info = verify_request_tsig(packet)
+                except TSIGError as e:
+                    print(f"[tsig] {question.qtype.name} rejected: {e}")
+                    out.header.flags.rcode = DNSRCode.REFUSED
+                    continue
+
+                if axfr_tsig_info is not None:
+                    tsig_rec, _ = axfr_tsig_info
+                    if not zone.axfr_allowed_tsig(tsig_rec.key_name):
+                        print(f"[tsig] {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
+                        out.header.flags.rcode = DNSRCode.REFUSED
+                        continue
+                elif not zone.axfr_allowed(client_ip):        # fall back to IP whitelist
+                    out.header.flags.rcode = DNSRCode.REFUSED
+                    continue
+                afxr()
             case DNSType.IXFR:
-                if transport != TCP or not zone.axfr_allowed(client_ip):
+                if transport != TCP:
+                    out.header.flags.rcode = DNSRCode.REFUSED
+                    continue
+
+                axfr_tsig_info = None
+                try: axfr_tsig_info = verify_request_tsig(packet)
+                except TSIGError as e:
+                    print(f"[tsig] {question.qtype.name} rejected: {e}")
+                    out.header.flags.rcode = DNSRCode.REFUSED
+                    continue
+
+                if axfr_tsig_info is not None:
+                    tsig_rec, _ = axfr_tsig_info
+                    if not zone.axfr_allowed_tsig(tsig_rec.key_name):
+                        print(f"[tsig] {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
+                        out.header.flags.rcode = DNSRCode.REFUSED
+                        continue
+                elif not zone.axfr_allowed(client_ip):        # fall back to IP whitelist
                     out.header.flags.rcode = DNSRCode.REFUSED
                     continue
 
@@ -355,31 +561,41 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                     if qask != zone.name: out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa(out.add_authoritive_rr)
 
-    max_size = BUFFER_SIZE
-    edns_options = []
-    for additional in packet.additional:
-        if isinstance(additional, EDNSOptRecord):
-            if max_size > additional.max_udp_size:
-                max_size = additional.max_udp_size
-            for option in additional.options:
-                if option.code == EDNSOptionCode.COOKIE:
-                    edns_options.append(EDNSOption(
-                        EDNSOptionCode.COOKIE,
-                        option.data + hmac.digest(EDNS_SECRET, option.data + client_ip, hashlib.md5)
-                    ))
-    out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
-
-    bout = bytes(out)
-    if transport == UDP and len(bout) > max_size:
-        out.header.flags.tc = True
-        return bytes(out)[:max_size]
-    return bout
+    return out, tsig_info
 
 class PrimaryServer(DNSSocket):
     def _pre_run(self): load_all()
-    def handle(self, *args, **kwargs): return handle(*args, **kwargs)
+    def handle(self, packet: DNSPacket, client_ip: bytes, transport: IntEnum, *args, **kwargs): 
+        out, tsig_info = handle(packet, client_ip, transport, *args, **kwargs)
+
+        max_size = BUFFER_SIZE
+        edns_options = []
+        for additional in packet.additional:
+            if isinstance(additional, EDNSOptRecord):
+                if max_size > additional.max_udp_size:
+                    max_size = additional.max_udp_size
+                for option in additional.options:
+                    if option.code == EDNSOptionCode.COOKIE:
+                        edns_options.append(EDNSOption(
+                            EDNSOptionCode.COOKIE,
+                            option.data + hmac.digest(EDNS_SECRET, option.data + client_ip, hashlib.md5)
+                        ))
+        out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
+
+        if tsig_info is not None:
+            tsig_rec, secret = tsig_info
+            out.sign_tsig(key_name=tsig_rec.key_name, key=secret, algorithm=tsig_rec.algorithm, fudge=tsig_rec.fudge, request_mac=tsig_rec.mac)
+
+        bout = bytes(out)
+        if transport == UDP and len(bout) > max_size:
+            out.header.flags.tc = True
+            return bytes(out)[:max_size]
+        return bout
     def _idle(self):
         load_all()
-        to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
-        for ip in to_delete: del ip_counts[ip]
+        global last_ip_clear
+        if (time.monotonic() - last_ip_clear) > 30:
+            to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
+            for ip in to_delete: del ip_counts[ip]
+            last_ip_clear = time.monotonic()
 PrimaryServer(HOST, PORT, TCP_PORT, BUFFER_SIZE).run()

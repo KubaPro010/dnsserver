@@ -140,12 +140,12 @@ def find_wildcard(qname: str, zone: str, zone_records: dict[str, list[DNSAnswer]
 
 to_fetch: list[tuple[DNSAnswer | None, str]] = []
 
+last_ip_clear = 0
 ip_counts: dict[bytes, Counter] = {}
 
 def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     out = DNSPacket(DNSHeader(
-        packet.header.transaction_id, DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)
-    ))
+        packet.header.transaction_id, DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)))
 
     if (c := ip_counts.get(client_ip)):
         c.beat()
@@ -170,6 +170,10 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             to_fetch.append((soa_record, zone))
         packet.header.flags.qr = True
         return bytes(packet)
+    elif packet.header.flags.opcode == DNSOPCode.UPDATE:
+        # The primary should handle that, not us
+        out.header.flags.rcode = DNSRCode.REFUSED
+        return bytes(out)
     if packet.header.flags.opcode != DNSOPCode.QUERY:
         print("Unhandled opcode:", packet.header.flags.opcode)
         out.header.flags.rcode = DNSRCode.NOTIMP
@@ -186,7 +190,9 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             if is_subdomain(question.qname, zone) and len(zone) > best_len:
                 this_zone = zone
                 best_len = len(zone)
-        if not this_zone: continue
+        if not this_zone:
+            out.header.flags.rcode = DNSRCode.NOTZONE
+            return bytes(out)
         soa = soas[this_zone]
         soas_here.append(soa.record)
         raw_zone_records, zone_records = records[this_zone]
@@ -204,13 +210,6 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             all_nxdomain = False
             any_found = True
             out.add_answer(soa.record)
-            continue
-        elif question.qtype == DNSType.AXFR and client_ip == socket.inet_aton("127.0.0.1"):
-            found_name = True
-            all_nxdomain = False
-            any_found = True
-            out.answers = raw_zone_records
-            out.header.num_answers = len(out.answers)
             continue
 
         def recurse(rrs: list[DNSAnswer]):
@@ -262,8 +261,11 @@ class SecondaryServer(DNSSocket):
     def _pre_run(self): 
         fetch_records()
     def _idle(self):
-        to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
-        for ip in to_delete: del ip_counts[ip]
+        global last_ip_clear
+        if (time.monotonic() - last_ip_clear) > 30:
+            to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
+            for ip in to_delete: del ip_counts[ip]
+            last_ip_clear = time.monotonic()
         
         for soa_record, zone in to_fetch:
             try: fetch_record(zone, soa_record)

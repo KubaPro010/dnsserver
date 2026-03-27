@@ -38,6 +38,7 @@ class EDNSOptionCode(IntEnum):
     REPORT = 18
 
 class DNSClass(IntEnum):
+    NONE = 0
     IN = 1
     CS = 2
     CH = 3
@@ -90,6 +91,7 @@ class DNSRCode(IntEnum):
     NOTIMP = 4
     REFUSED = 5
     YXDOMAIN = 6
-    XRRSET = 7
-    NOTAUTH = 8
-    NOTZONE = 9
+    YXRRSET = 7
+    NXRRSET = 8
+    NOTAUTH = 9
+    NOTZONE = 10
