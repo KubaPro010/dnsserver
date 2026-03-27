@@ -79,7 +79,7 @@ def parse_ixfr(packet: DNSPacket, zone: str):
 
     raw_records, out = records[zone]
 
-    adding = False
+    adding = True
     for anwser in packet.answers[1:]:
         match anwser.type:
             case DNSType.SOA: adding = not adding
