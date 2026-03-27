@@ -72,6 +72,7 @@ class Zone:
     records_mtime: float | None = None
     update_tsig_keys: list[str] = field(default_factory=list)
     axfr_tsig_keys: list[str] = field(default_factory=list)
+    allowed_axfr_hosts: list[str] = field(default_factory=list)
 
     def update_allowed_tsig(self, key_name: str) -> bool: return key_name in self.update_tsig_keys
 
@@ -79,10 +80,10 @@ class Zone:
 
     def axfr_allowed(self, client_ip: bytes) -> bool:
         if socket.inet_aton("127.0.0.1") == client_ip: return True
-        for ns in self.ns_list:
+        for host in self.ns_list + self.allowed_axfr_hosts:
             try:
-                if socket.inet_aton(socket.gethostbyname(ns)) == client_ip: return True
-            except OSError: pass
+                if socket.inet_aton(socket.gethostbyname(host)) == client_ip: return True
+            except OSError: pass            
         return False
     
     def save(self):
@@ -235,6 +236,7 @@ for section in config.sections():
         serial=sec.getint("serial", 0),
         update_tsig_keys=[k.strip() for k in sec.get("update_tsig_keys", "").split(",") if k.strip()],
         axfr_tsig_keys=[k.strip() for k in sec.get("axfr_tsig_keys", "").split(",") if k.strip()],
+        allowed_axfr_hosts=[k.strip() for k in sec.get("allowed_axfr_hosts", "").split(",") if k.strip()],
     ))
 
 if not zones: raise RuntimeError("No [zone:*] sections found in config")
