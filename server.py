@@ -91,7 +91,7 @@ class Zone:
         for (name, qtype), (ttl, values) in self.records_cache.items():
             # Normalise name back to relative form for readability (optional)
             for value in values:
-                lines.append(f"{qtype.name}\t{name}\t{ttl}\t{value}\n")
+                lines.append(f"{DNSType(qtype).name}\t{name}\t{ttl}\t{value}\n")
         tmp = self.records_file.with_suffix(".tmp")
         tmp.write_text("".join(lines))
         tmp.replace(self.records_file)  # atomic on POSIX
