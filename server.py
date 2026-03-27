@@ -567,6 +567,20 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                 else:
                     if qask != zone.name: out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa(out.add_authoritive_rr)
+    
+    for aw in out.answers + out.authority:
+        if aw.type not in (DNSType.CNAME, DNSType.NS, DNSType.MX): continue
+        name = aw.rdata_decoded
+        if aw.type == DNSType.MX: _, name = name.split(maxsplit=1)
+
+        zone = find_zone(name)
+        if zone is None or zone.records_cache is None: continue
+        ttl, a = zone.records_cache.get((name, DNSType.A), (0, []))
+        for value in a:
+            out.add_additional_rr(DNSAnswer(name, DNSType.A, DNSClass.IN, ttl, rdata_decoded=value))
+        ttl, aaaa = zone.records_cache.get((name, DNSType.AAAA), (0, []))
+        for value in aaaa:
+            out.add_additional_rr(DNSAnswer(name, DNSType.AAAA, DNSClass.IN, ttl, rdata_decoded=value))
 
     return out, tsig_info
 

@@ -195,7 +195,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             return bytes(out)
         soa = soas[this_zone]
         soas_here.append(soa.record)
-        raw_zone_records, zone_records = records[this_zone]
+        _, zone_records = records[this_zone]
 
         if time.monotonic() >= (soa.age + soa.expire):
             out.header.flags.rcode = DNSRCode.SERVFAIL
@@ -237,6 +237,27 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         out.header.flags.rcode = DNSRCode.NXDOMAIN
         out.authority += soas_here
         out.header.num_authority_rr += len(soas_here)
+
+
+    for aw in out.answers + out.authority:
+        if aw.type not in (DNSType.CNAME, DNSType.NS, DNSType.MX): continue
+        name = aw.rdata_decoded
+        if aw.type == DNSType.MX: _, name = name.split(maxsplit=1)
+
+        this_zone = None
+        best_len = -1
+        for zone in records.keys():
+            if is_subdomain(name, zone) and len(zone) > best_len:
+                this_zone = zone
+                best_len = len(zone)
+        if not this_zone: continue
+        _, zone_records = records[this_zone]
+
+        # str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]
+        for record in zone_records.get(name, []):
+            if record.type not in (DNSType.A, DNSType.AAAA): continue
+            if record.name != name: continue
+            out.add_additional_rr(record)
 
     max_size = BUFFER_SIZE
     edns_options = []
