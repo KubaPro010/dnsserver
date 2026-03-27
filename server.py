@@ -483,9 +483,10 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                         print(f"[tsig] {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
                         out.header.flags.rcode = DNSRCode.REFUSED
                         continue
-                elif not zone.axfr_allowed(client_ip):        # fall back to IP whitelist
+                elif not zone.axfr_allowed(client_ip):
                     out.header.flags.rcode = DNSRCode.REFUSED
                     continue
+                tsig_info = axfr_tsig_info
                 afxr()
             case DNSType.IXFR:
                 if transport != TCP:
@@ -505,9 +506,10 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                         print(f"[tsig] {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
                         out.header.flags.rcode = DNSRCode.REFUSED
                         continue
-                elif not zone.axfr_allowed(client_ip):        # fall back to IP whitelist
+                elif not zone.axfr_allowed(client_ip):
                     out.header.flags.rcode = DNSRCode.REFUSED
                     continue
+                tsig_info = axfr_tsig_info
 
                 client_serial: int | None = None
                 for auth_rr in packet.authority:
