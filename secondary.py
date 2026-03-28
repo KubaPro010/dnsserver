@@ -243,19 +243,19 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         if aw.type not in (DNSType.CNAME, DNSType.NS, DNSType.MX): continue
         name = aw.rdata_decoded
         if aw.type == DNSType.MX: _, name = name.split(maxsplit=1)
-        name = name.rstrip(".") + "."
+        normalized = name.rstrip(".") + "."
 
         this_zone = None
         best_len = -1
         for zone in records.keys():
-            if is_subdomain(name, zone) and len(zone) > best_len:
+            if is_subdomain(normalized, zone) and len(zone) > best_len:
                 this_zone = zone
                 best_len = len(zone)
         if not this_zone: continue
         _, zone_records = records[this_zone]
 
         # str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]
-        for record in zone_records.get(name, []):
+        for record in zone_records.get(normalized, []):
             if record.type not in (DNSType.A, DNSType.AAAA): continue
             if record.name != name: continue
             out.add_additional_rr(record)
