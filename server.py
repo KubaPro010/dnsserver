@@ -572,6 +572,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
         if aw.type not in (DNSType.CNAME, DNSType.NS, DNSType.MX): continue
         name = aw.rdata_decoded
         if aw.type == DNSType.MX: _, name = name.split(maxsplit=1)
+        name = name.rstrip(".") + "."
 
         zone = find_zone(name)
         if zone is None or zone.records_cache is None: continue
