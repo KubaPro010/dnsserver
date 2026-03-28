@@ -257,7 +257,6 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         # str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]
         for record in zone_records.get(normalized, []):
             if record.type not in (DNSType.A, DNSType.AAAA): continue
-            if record.name != name: continue
             out.add_additional_rr(record)
 
     max_size = BUFFER_SIZE
