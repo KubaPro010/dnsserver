@@ -243,6 +243,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         if aw.type not in (DNSType.CNAME, DNSType.NS, DNSType.MX): continue
         name = aw.rdata_decoded
         if aw.type == DNSType.MX: _, name = name.split(maxsplit=1)
+        name = name.rstrip(".") + "."
 
         this_zone = None
         best_len = -1
