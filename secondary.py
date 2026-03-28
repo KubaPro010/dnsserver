@@ -254,6 +254,9 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         if not this_zone: continue
         _, zone_records = records[this_zone]
 
+        print("ZONE RECORDS KEYS:", list(zone_records.keys()))
+        print("LOOKING FOR:", normalized)
+
         # str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]
         for record in zone_records.get(normalized, []):
             if record.type not in (DNSType.A, DNSType.AAAA): continue
