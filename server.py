@@ -421,7 +421,7 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
             out_packet.header.flags.rcode = DNSRCode.REFUSED
             return out_packet, None
         try:
-            tsig_rec = packet.verify_tsig({micro_zone.name: micro_zone.key_secret})
+            tsig_rec = packet.verify_tsig({"update": micro_zone.key_secret})
             tsig_info = (tsig_rec, micro_zone.key_secret)
         except TSIGError as e:
             logging.info(f"tsig - micro-zone UPDATE for {micro_zone.name} rejected: {e}")
