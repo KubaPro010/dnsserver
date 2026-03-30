@@ -291,13 +291,6 @@ class Zone:
                     list(set(base_values) | set(values))
                 )
 
-        self.records_cache = merged_records
-
-        # micro-zones: static + dynamic (dynamic overrides)
-        self.micro_zones = {**static_micro, **dyn_micro}
-
-        self.records_mtime = (mtime, dyn_mtime)
-
         additions, deletions = self._diff_records(self.records_cache, merged_records)
 
         if additions or deletions:
@@ -318,6 +311,10 @@ class Zone:
 
             if len(journal) > MAX_JOURNAL_ENTRIES:
                 del journal[: len(journal) - MAX_JOURNAL_ENTRIES]
+        
+        self.records_cache = merged_records
+        self.micro_zones = {**static_micro, **dyn_micro}
+        self.records_mtime = (mtime, dyn_mtime)
 
         threading.Thread(target=self.notify_all_ns).start()
 
