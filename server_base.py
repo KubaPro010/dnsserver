@@ -1,6 +1,9 @@
 import traceback, socket, select, struct
 from enum import IntEnum
 from protocol.frame import DNSPacket, EDNSOptRecord
+import logging
+
+logger = logging.getLogger("server")
 
 def is_subdomain(sub: str, parent: str) -> bool:
     sub = sub.rstrip('.').lower()
@@ -75,10 +78,10 @@ class DNSSocket:
 
         udp.bind((host, port))
         tcp.bind((host, tcp_port))
-        print(f"UDP listening on {host}:{port}")
+        logger.info(f"UDP listening on {host}:{port}")
 
         tcp.listen(32)
-        print(f"TCP listening on {host}:{tcp_port}")
+        logger.info(f"TCP listening on {host}:{tcp_port}")
 
         self.tcp = tcp
         self.udp = udp

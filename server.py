@@ -1,5 +1,5 @@
 from protocol.frame import *
-import socket
+import socket, logging
 import pathlib, datetime
 import configparser, argparse
 import hmac, hashlib, random, base64
@@ -8,8 +8,13 @@ from lib.libcounter import Counter
 from server_base import DNSSocket, UDP, TCP, is_subdomain, _parse_soa_serial, query_dns
 import threading, time
 
+logging.basicConfig(level=logging.INFO)
+
 BUFFER_SIZE = 1232
+
 EDNS_SECRET = random.randbytes(8)
+logging.debug("The EDNS secret for this run is", EDNS_SECRET)
+
 MAX_JOURNAL_ENTRIES = 100
 
 parser = argparse.ArgumentParser()
@@ -25,14 +30,6 @@ TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
 REQUESTS_PER_SECOND = config.getint("server", "rps", fallback=75)
 
 tsig_keys: dict[str, tuple[bytes, TSIGAlgorithm]] = {}
-
-for section in config.sections():
-    if not section.startswith("tsig:"): continue
-    key_name = section[len("tsig:"):]
-    sec = config[section]
-    secret = base64.b64decode(sec["secret"])
-    algorithm = TSIGAlgorithm(sec.get("algorithm", TSIGAlgorithm.HMAC_SHA256))
-    tsig_keys[key_name] = (secret, algorithm)
 
 @dataclass
 class JournalEntry:
@@ -115,7 +112,7 @@ class Zone:
         for ns in self.ns_list[:]:
             if ns == primary_ns: continue
             try: query_dns(packet, ns, BUFFER_SIZE)
-            except Exception as e: print(f"Could not notify {ns} ({e})")
+            except Exception as e: logging.warning(f"Could not notify {ns} ({e})")
 
     def compute_soa_serial(self, serial: int | None = None):
         if serial is None: serial = self.serial
@@ -156,7 +153,7 @@ class Zone:
                     continue
                 parts = line.split("\t", 3)
                 if len(parts) != 4:
-                    print(f"[warn] skipping malformed line: {line!r}")
+                    logging.warning(f"skipping malformed line: {line!r}")
                     continue
                 rtype, name, ttl, value = parts
 
@@ -165,13 +162,14 @@ class Zone:
 
                 try: qtype = DNSType[rtype.upper()]
                 except (KeyError, ValueError) as e:
-                    print(f"[warn] skipping record ({e}): {line!r}")
+                    logging.warning(f"skipping record ({e}): {line!r}")
                     continue
 
                 key = (name, qtype)
                 if key not in new_records: new_records[key] = (int(ttl), [])
                 if new_records[key][0] < int(ttl):
-                    print(f"[warn] mismatched TTL on {name}, using highest")
+                    # TODO: fix this
+                    logging.warning(f"mismatched TTL on {name}, using highest")
                     new_records[key] = (int(ttl), new_records[key][1])
                 new_records[key][1].append(value)
 
@@ -194,7 +192,7 @@ class Zone:
 
         threading.Thread(target=self.notify_all_ns).start()
 
-        print(f"[info] [{self.name}] loaded {len(new_records)} record sets "
+        logging.info(f"[{self.name}] loaded {len(new_records)} record sets "
               f"(serial={self.compute_soa_serial()})")
 
     def resolve(self, qname: str, qtype: DNSType):
@@ -215,34 +213,39 @@ class Zone:
 zones: list[Zone] = []
 
 for section in config.sections():
-    if not section.startswith("zone:"): continue
-    zone_name = section[len("zone:"):].rstrip(".") + "."
-    sec = config[section]
-    primary_ns = sec["primary_ns"]
-    ns_list = [primary_ns] + [n for n in sec.get("ns", "").split(",") if n]
-    zones.append(Zone(
-        name=zone_name,
-        records_file=pathlib.Path(sec["file"]).resolve(),
-        primary_ns=primary_ns,
-        ns_list=ns_list,
-        soa_cfg={
-            "email": sec.get("email", "hostmaster." + zone_name),
-            "ttl": sec.getint("ttl", 300),
-            "refresh": sec.getint("refresh", 3600),
-            "retry": sec.getint("retry", 1800),
-            "expire": sec.getint("expire", 1209600),
-            "min": sec.getint("min", 3600),
-        },
-        serial=sec.getint("serial", 0),
-        update_tsig_keys=[k.strip() for k in sec.get("update_tsig_keys", "").split(",") if k.strip()],
-        axfr_tsig_keys=[k.strip() for k in sec.get("axfr_tsig_keys", "").split(",") if k.strip()],
-        allowed_axfr_hosts=[k.strip() for k in sec.get("allowed_axfr_hosts", "").split(",") if k.strip()],
-    ))
+    if section.startswith("zone:"):
+        zone_name = section[len("zone:"):].rstrip(".") + "."
+        sec = config[section]
+        primary_ns = sec["primary_ns"]
+        ns_list = [primary_ns] + [n for n in sec.get("ns", "").split(",") if n]
+        zones.append(Zone(
+            name=zone_name,
+            records_file=pathlib.Path(sec["file"]).resolve(),
+            primary_ns=primary_ns,
+            ns_list=ns_list,
+            soa_cfg={
+                "email": sec.get("email", "hostmaster." + zone_name),
+                "ttl": sec.getint("ttl", 300),
+                "refresh": sec.getint("refresh", 3600),
+                "retry": sec.getint("retry", 1800),
+                "expire": sec.getint("expire", 1209600),
+                "min": sec.getint("min", 3600),
+            },
+            serial=sec.getint("serial", 0),
+            update_tsig_keys=[k.strip() for k in sec.get("update_tsig_keys", "").split(",") if k.strip()],
+            axfr_tsig_keys=[k.strip() for k in sec.get("axfr_tsig_keys", "").split(",") if k.strip()],
+            allowed_axfr_hosts=[k.strip() for k in sec.get("allowed_axfr_hosts", "").split(",") if k.strip()],
+        ))
+    elif section.startswith("tsig:"):
+        key_name = section[len("tsig:"):]
+        sec = config[section]
+        secret = base64.b64decode(sec["secret"])
+        algorithm = TSIGAlgorithm(sec.get("algorithm", TSIGAlgorithm.HMAC_SHA256))
+        tsig_keys[key_name] = (secret, algorithm)
 
 if not zones: raise RuntimeError("No [zone:*] sections found in config")
 
 def find_zone(qname: str) -> Zone | None:
-    """Return the most specific (longest) zone that is an ancestor of qname."""
     best: Zone | None = None
     best_len = -1
     for z in zones:
@@ -254,8 +257,7 @@ def find_zone(qname: str) -> Zone | None:
 def load_all():
     for z in zones:
         try: z.load()
-        except Exception as e:
-            print(f"[error] loading zone {z.name}: {e}")
+        except Exception as e: logging.error(f"loading zone {z.name}: {e}")
 
 last_ip_clear = 0
 ip_counts: dict[bytes, Counter] = {}
@@ -272,14 +274,12 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
     is_localhost = (client_ip == socket.inet_aton("127.0.0.1"))
 
     tsig_info: tuple[TSIGRecord, bytes] | None = None
-    try:
-        tsig_info = verify_request_tsig(packet)
+    try: tsig_info = verify_request_tsig(packet)
     except TSIGError as e:
-        print(f"[tsig] UPDATE rejected: {e}")
+        logging.info(f"tsig - UPDATE rejected: {e}")
         out_packet.header.flags.rcode = DNSRCode.REFUSED
         return out_packet, None
 
-    # Must be localhost OR carry a valid TSIG (zone check comes later)
     if not is_localhost and tsig_info is None:
         out_packet.header.flags.rcode = DNSRCode.REFUSED
         return out_packet, None
@@ -298,7 +298,7 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
         assert tsig_info is not None
         tsig_rec, _ = tsig_info
         if not zone.update_allowed_tsig(tsig_rec.key_name):
-            print(f"[tsig] UPDATE key {tsig_rec.key_name!r} not authorised for {zone.name}")
+            logging.info(f"tsig - UPDATE key {tsig_rec.key_name!r} not authorized for {zone.name}")
             out_packet.header.flags.rcode = DNSRCode.REFUSED
             return out_packet, None
 
@@ -401,7 +401,7 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
         zone.records_cache = new_cache
         zone.save()
         threading.Thread(target=zone.notify_all_ns).start()
-        print(f"[update] [{zone.name}] +{len(additions)}/-{len(deletions)} RRs "
+        logging.info(f"update - [{zone.name}] +{len(additions)}/-{len(deletions)} RRs "
               f"(serial {old_soa_serial} → {new_soa_serial})")
 
     return out_packet, tsig_info
@@ -429,7 +429,6 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
             out.header.flags.rcode = DNSRCode.NOTIMP
             return out, tsig_info
     if packet.header.flags.opcode != DNSOPCode.QUERY:
-        print("Unhandled opcode:", packet.header.flags.opcode)
         out.header.flags.rcode = DNSRCode.NOTIMP
         return out, tsig_info
 
@@ -478,14 +477,14 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                 try:
                     axfr_tsig_info = verify_request_tsig(packet)
                 except TSIGError as e:
-                    print(f"[tsig] {question.qtype.name} rejected: {e}")
+                    logging.warning(f"tsig - {question.qtype.name} rejected: {e}")
                     out.header.flags.rcode = DNSRCode.REFUSED
                     continue
 
                 if axfr_tsig_info is not None:
                     tsig_rec, _ = axfr_tsig_info
                     if not zone.axfr_allowed_tsig(tsig_rec.key_name):
-                        print(f"[tsig] {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
+                        logging.warning(f"tsig - {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
                         out.header.flags.rcode = DNSRCode.REFUSED
                         continue
                 elif not zone.axfr_allowed(client_ip):
@@ -501,14 +500,14 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                 axfr_tsig_info = None
                 try: axfr_tsig_info = verify_request_tsig(packet)
                 except TSIGError as e:
-                    print(f"[tsig] {question.qtype.name} rejected: {e}")
+                    logging.warning(f"tsig - {question.qtype.name} rejected: {e}")
                     out.header.flags.rcode = DNSRCode.REFUSED
                     continue
 
                 if axfr_tsig_info is not None:
                     tsig_rec, _ = axfr_tsig_info
                     if not zone.axfr_allowed_tsig(tsig_rec.key_name):
-                        print(f"[tsig] {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
+                        logging.warning(f"tsig - {question.qtype.name} key {tsig_rec.key_name!r} not authorised for {zone.name}")
                         out.header.flags.rcode = DNSRCode.REFUSED
                         continue
                 elif not zone.axfr_allowed(client_ip):
@@ -525,19 +524,19 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                 current_serial = zone.compute_soa_serial()
 
                 if client_serial is None:
-                    print(f"[ixfr] [{zone.name}] no client serial, falling back to AXFR")
-                    afxr()
+                    logging.warning(f"ixfr - [{zone.name}] no client serial, falling back to AXFR")
+                    afxr() # type: ignore
                     continue
 
                 if client_serial == current_serial:
-                    soa()
+                    soa() # type: ignore
                     continue
 
                 chain = get_journal_chain(zone.name, client_serial, current_serial)
 
                 if chain is None:
                     # Journal doesn't cover the requested range — full AXFR fallback.
-                    print(f"[ixfr] [{zone.name}] journal gap from {client_serial} to {current_serial}, falling back to AXFR")
+                    logging.warning(f"ixfr - [{zone.name}] journal gap from {client_serial} to {current_serial}, falling back to AXFR")
                     afxr()
                     continue
                 soa()  # opening new SOA
@@ -548,7 +547,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                     for rr in entry.additions: out.add_answer(rr)
                 soa()
 
-                print(f"[ixfr] [{zone.name}] sent {len(chain)} delta(s) "
+                logging.warning(f"ixfr - [{zone.name}] sent {len(chain)} delta(s) "
                       f"from serial {client_serial} to {current_serial}")
             case _:
                 result, exists = zone.resolve(question.qname, question.qtype)
