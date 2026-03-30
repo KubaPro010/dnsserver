@@ -298,8 +298,26 @@ class Zone:
 
         self.records_mtime = (mtime, dyn_mtime)
 
-        # journal / serial logic stays same
-        self.serial += 1
+        additions, deletions = self._diff_records(self.records_cache, merged_records)
+
+        if additions or deletions:
+            old_soa_serial = self.compute_soa_serial()
+
+            self.serial += 1
+            new_soa_serial = self.compute_soa_serial()
+
+            entry = JournalEntry(
+                old_soa_serial=old_soa_serial,
+                new_soa_serial=new_soa_serial,
+                additions=additions,
+                deletions=deletions
+            )
+
+            journal = soa_journal.setdefault(self.name, [])
+            journal.append(entry)
+
+            if len(journal) > MAX_JOURNAL_ENTRIES:
+                del journal[: len(journal) - MAX_JOURNAL_ENTRIES]
 
         threading.Thread(target=self.notify_all_ns).start()
 
