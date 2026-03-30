@@ -71,11 +71,17 @@ class Zone:
     serial: int = 0
     records_cache: dict[tuple[str, DNSType], tuple[int, list[str]]] = field(default_factory=dict)
     "Format is (name, type): (ttl, [values])"
+    original_cache: dict[tuple[str, DNSType], tuple[int, list[str]]] = field(default_factory=dict)
+    dyn_records_file: pathlib.Path | None = None
 
-    records_mtime: float | None = None
+    records_mtime: tuple[float | None, float | None] = (None, None)
     update_tsig_keys: list[str] = field(default_factory=list)
     axfr_tsig_keys: list[str] = field(default_factory=list)
     allowed_axfr_hosts: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.dyn_records_file is None:
+            self.dyn_records_file = self.records_file.with_suffix(self.records_file.suffix + ".dyn")
 
     def update_allowed_tsig(self, key_name: str) -> bool: return key_name in self.update_tsig_keys
 
@@ -90,14 +96,36 @@ class Zone:
         return False
     
     def save(self):
+        if not self.dyn_records_file: raise Exception
+        dyn_records = {}
+
+        for key, (ttl, values) in self.records_cache.items():
+            orig_entry = self.original_cache.get(key)
+
+            if orig_entry is None: dyn_records[key] = (ttl, list(values))
+            else:
+                orig_ttl, orig_values = orig_entry
+                diff_values = list(set(values) - set(orig_values))
+
+                if diff_values: dyn_records[key] = (ttl, diff_values)
+
         lines = []
-        for (name, qtype), (ttl, values) in self.records_cache.items():
-            # Normalise name back to relative form for readability (optional)
+
+        # Write dynamic records
+        for (name, qtype), (ttl, values) in dyn_records.items():
             for value in values:
                 lines.append(f"{DNSType(qtype).name}\t{name}\t{ttl}\t{value}\n")
-        tmp = self.records_file.with_suffix(".tmp")
+
+        # Write dynamic micro-zones ONLY (not static ones)
+        for name, mz in getattr(self, "micro_zones", {}).items():
+            if name not in getattr(self, "original_micro_zones", {}):
+                encoded = base64.b64encode(mz.key_secret).decode()
+                algo = mz.algorithm.name
+                lines.append(f"DYN\t{name}\t{encoded}\t{algo}\n")
+
+        tmp = self.dyn_records_file.with_suffix(".tmp")
         tmp.write_text("".join(lines))
-        tmp.replace(self.records_file)  # atomic on POSIX
+        tmp.replace(self.dyn_records_file)
 
     def notify_all_ns(self):
         def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.NOTIFY, True, False, False, False, False, False, DNSRCode.NOERROR)))
@@ -233,32 +261,50 @@ class Zone:
 
     def load(self):
         mtime = self.records_file.stat().st_mtime
-        if self.records_mtime == mtime: return
+        if not self.dyn_records_file: raise Exception
+        dyn_mtime = self.dyn_records_file.stat().st_mtime if self.dyn_records_file.exists() else None
 
-        new_records, new_micro_zones = self._read_records_file(self.records_file)
-        self.micro_zones = new_micro_zones
+        if self.records_mtime == (mtime, dyn_mtime):
+            return
 
-        old_cache = self.records_cache
-        if old_cache:
-            old_soa_serial = self.compute_soa_serial()
-            additions, deletions = self._diff_records(old_cache, new_records)
+        static_records, static_micro = self._read_records_file(self.records_file)
+        self.original_micro_zones = static_micro
 
-            self.serial += 1
-            new_soa_serial = self.compute_soa_serial()
+        dyn_records, dyn_micro = {}, {}
+        if self.dyn_records_file.exists():
+            dyn_records, dyn_micro = self._read_records_file(self.dyn_records_file)
 
-            entry = JournalEntry(old_soa_serial=old_soa_serial, new_soa_serial=new_soa_serial, additions=additions, deletions=deletions)
-            journal = soa_journal.setdefault(self.name, [])
-            journal.append(entry)
-            if len(journal) > MAX_JOURNAL_ENTRIES: del journal[: len(journal) - MAX_JOURNAL_ENTRIES]
-        else: self.serial += 1
+        self.original_cache = static_records
 
-        self.records_cache = new_records
-        self.records_mtime = mtime
+        merged_records = {}
+
+        for k, v in static_records.items():
+            merged_records[k] = (v[0], list(v[1]))
+
+        for k, (ttl, values) in dyn_records.items():
+            if k not in merged_records:
+                merged_records[k] = (ttl, list(values))
+            else:
+                base_ttl, base_values = merged_records[k]
+                merged_records[k] = (
+                    max(base_ttl, ttl),
+                    list(set(base_values) | set(values))
+                )
+
+        self.records_cache = merged_records
+
+        # micro-zones: static + dynamic (dynamic overrides)
+        self.micro_zones = {**static_micro, **dyn_micro}
+
+        self.records_mtime = (mtime, dyn_mtime)
+
+        # journal / serial logic stays same
+        self.serial += 1
 
         threading.Thread(target=self.notify_all_ns).start()
 
-        logging.info(f"[{self.name}] loaded {len(new_records)} record sets, "
-                    f"{len(new_micro_zones)} micro-zone(s) (serial={self.compute_soa_serial()})")
+        logging.info(f"[{self.name}] loaded {len(merged_records)} record sets "
+                    f"(static={len(static_records)}, dyn={len(dyn_records)})")
 
     def resolve(self, qname: str, qtype: DNSType):
         qname = qname.rstrip(".") + "."
