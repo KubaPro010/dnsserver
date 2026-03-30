@@ -56,6 +56,12 @@ def get_journal_chain(zone_name: str, from_serial: int, to_serial: int) -> list[
     return chain
 
 @dataclass
+class MicroZone:
+    name: str
+    key_secret: bytes
+    algorithm: TSIGAlgorithm
+
+@dataclass
 class Zone:
     name: str
     records_file: pathlib.Path
@@ -141,16 +147,67 @@ class Zone:
 
         return additions, deletions
 
-    def load(self):
-        mtime = self.records_file.stat().st_mtime
-        if self.records_mtime == mtime: return
+    def _read_records_file(self, filepath: pathlib.Path, seen: set[pathlib.Path] | None = None) -> tuple[dict, dict[str, MicroZone]]:
+        if seen is None: seen = set()
+        resolved = filepath.resolve()
+        if resolved in seen:
+            logging.warning(f"circular include detected: {filepath}, skipping")
+            return {}, {}
+        seen.add(resolved)
 
-        new_records = {}
-        with open(self.records_file) as f:
+        records: dict = {}
+        micro_zones: dict[str, MicroZone] = {}
+
+        with open(filepath) as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#") or line.startswith(";"):
+                if not line or line.startswith("#") or line.startswith(";"): continue
+
+                if line.startswith("@"):
+                    include_path = pathlib.Path(line[1:])
+                    if not include_path.is_absolute(): include_path = filepath.parent / include_path
+                    try:
+                        inc_records, inc_micro_zones = self._read_records_file(include_path, seen)
+                        micro_zones.update(inc_micro_zones)
+                        for key, (ttl, values) in inc_records.items():
+                            if key not in records: records[key] = (ttl, [])
+                            existing_ttl, existing_values = records[key]
+                            if ttl > existing_ttl:
+                                logging.warning(f"mismatched TTL on {key[0]}, using highest")
+                                existing_ttl = ttl
+                            records[key] = (existing_ttl, existing_values + [v for v in values if v not in existing_values])
+                    except OSError as e: logging.warning(f"could not include file {include_path}: {e}")
                     continue
+
+                parts = line.split("\t")
+                rtype = parts[0].upper()
+
+                if rtype == "DYN":
+                    # DYN\tname\tbase64secret[\talgorithm]
+                    if len(parts) < 3:
+                        logging.warning(f"skipping malformed DYN line: {line!r}")
+                        continue
+
+                    name = parts[1]
+                    if name == "@": name = self.name
+                    elif not name.endswith("."): name = name + "." + self.name
+
+                    try: key_secret = base64.b64decode(parts[2])
+                    except Exception as e:
+                        logging.warning(f"skipping DYN line, bad base64 ({e}): {line!r}")
+                        continue
+
+                    if len(parts) >= 4 and parts[3].strip():
+                        try: algorithm = TSIGAlgorithm(parts[3].strip())
+                        except ValueError:
+                            logging.warning(f"unknown algorithm {parts[3]!r} on DYN line, defaulting to HMAC-SHA256")
+                            algorithm = TSIGAlgorithm.HMAC_SHA256
+                    else: algorithm = TSIGAlgorithm.HMAC_SHA256
+
+                    micro_zones[name] = MicroZone(name=name, key_secret=key_secret, algorithm=algorithm)
+                    logging.info(f"[{self.name}] micro-zone DYN registered for {name}")
+                    continue
+
                 parts = line.split("\t", 3)
                 if len(parts) != 4:
                     logging.warning(f"skipping malformed line: {line!r}")
@@ -166,12 +223,20 @@ class Zone:
                     continue
 
                 key = (name, qtype)
-                if key not in new_records: new_records[key] = (int(ttl), [])
-                if new_records[key][0] < int(ttl):
-                    # TODO: fix this
+                if key not in records: records[key] = (int(ttl), [])
+                if records[key][0] < int(ttl):
                     logging.warning(f"mismatched TTL on {name}, using highest")
-                    new_records[key] = (int(ttl), new_records[key][1])
-                new_records[key][1].append(value)
+                    records[key] = (int(ttl), records[key][1])
+                records[key][1].append(value)
+
+        return records, micro_zones
+
+    def load(self):
+        mtime = self.records_file.stat().st_mtime
+        if self.records_mtime == mtime: return
+
+        new_records, new_micro_zones = self._read_records_file(self.records_file)
+        self.micro_zones = new_micro_zones
 
         old_cache = self.records_cache
         if old_cache:
@@ -192,8 +257,8 @@ class Zone:
 
         threading.Thread(target=self.notify_all_ns).start()
 
-        logging.info(f"[{self.name}] loaded {len(new_records)} record sets "
-              f"(serial={self.compute_soa_serial()})")
+        logging.info(f"[{self.name}] loaded {len(new_records)} record sets, "
+                    f"{len(new_micro_zones)} micro-zone(s) (serial={self.compute_soa_serial()})")
 
     def resolve(self, qname: str, qtype: DNSType):
         qname = qname.rstrip(".") + "."
@@ -209,8 +274,9 @@ class Zone:
             if result: return result, True
 
         return None, False
-
+    
 zones: list[Zone] = []
+micro_zones: dict[str, MicroZone] = field(default_factory=dict)
 
 for section in config.sections():
     if section.startswith("zone:"):
@@ -269,20 +335,8 @@ def verify_request_tsig(packet: DNSPacket) -> tuple[TSIGRecord, bytes] | None:
     tsig_rec = packet.verify_tsig(keys_bytes)
     secret, _ = tsig_keys[tsig_rec.key_name]
     return tsig_rec, secret
-
 def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNSPacket, tuple[TSIGRecord, bytes] | None]:
     is_localhost = (client_ip == socket.inet_aton("127.0.0.1"))
-
-    tsig_info: tuple[TSIGRecord, bytes] | None = None
-    try: tsig_info = verify_request_tsig(packet)
-    except TSIGError as e:
-        logging.info(f"tsig - UPDATE rejected: {e}")
-        out_packet.header.flags.rcode = DNSRCode.REFUSED
-        return out_packet, None
-
-    if not is_localhost and tsig_info is None:
-        out_packet.header.flags.rcode = DNSRCode.REFUSED
-        return out_packet, None
 
     if packet.header.num_questions != 1 or packet.questions[0].qtype != DNSType.SOA:
         out_packet.header.flags.rcode = DNSRCode.FORMERR
@@ -294,18 +348,48 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
         out_packet.header.flags.rcode = DNSRCode.NOTZONE
         return out_packet, None
 
-    if not is_localhost:
-        assert tsig_info is not None
-        tsig_rec, _ = tsig_info
-        if not zone.update_allowed_tsig(tsig_rec.key_name):
-            logging.info(f"tsig - UPDATE key {tsig_rec.key_name!r} not authorized for {zone.name}")
+    normalized_target = raw_zone.rstrip(".") + "."
+    micro_zone = zone.micro_zones.get(normalized_target)
+
+    tsig_info: tuple[TSIGRecord, bytes] | None = None
+
+    if micro_zone is not None:
+        has_tsig = any(isinstance(rr, TSIGRecord) for rr in packet.additional)
+        if not has_tsig:
+            logging.info(f"tsig - micro-zone UPDATE for {micro_zone.name} rejected: no TSIG")
             out_packet.header.flags.rcode = DNSRCode.REFUSED
             return out_packet, None
+        try:
+            tsig_rec = packet.verify_tsig({micro_zone.name: micro_zone.key_secret})
+            tsig_info = (tsig_rec, micro_zone.key_secret)
+        except TSIGError as e:
+            logging.info(f"tsig - micro-zone UPDATE for {micro_zone.name} rejected: {e}")
+            out_packet.header.flags.rcode = DNSRCode.REFUSED
+            return out_packet, None
+        update_scope = micro_zone.name   # updates restricted to this subtree
+    else:
+        try: tsig_info = verify_request_tsig(packet)
+        except TSIGError as e:
+            logging.info(f"tsig - UPDATE rejected: {e}")
+            out_packet.header.flags.rcode = DNSRCode.REFUSED
+            return out_packet, None
+
+        if not is_localhost and tsig_info is None:
+            out_packet.header.flags.rcode = DNSRCode.REFUSED
+            return out_packet, None
+
+        if tsig_info is not None:
+            tsig_rec, _ = tsig_info
+            if not zone.update_allowed_tsig(tsig_rec.key_name):
+                logging.info(f"tsig - UPDATE key {tsig_rec.key_name!r} not authorized for {zone.name}")
+                out_packet.header.flags.rcode = DNSRCode.REFUSED
+                return out_packet, None
+        update_scope = zone.name
 
     for prereq in packet.answers:
         normalized = prereq.name.rstrip(".") + "."
 
-        if not is_subdomain(normalized, zone.name):
+        if not is_subdomain(normalized, update_scope):
             out_packet.header.flags.rcode = DNSRCode.NOTZONE
             return out_packet, None
 
@@ -345,7 +429,7 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
     for upd in packet.authority:
         normalized = upd.name.rstrip(".") + "."
 
-        if not is_subdomain(normalized, zone.name):
+        if not is_subdomain(normalized, update_scope):
             out_packet.header.flags.rcode = DNSRCode.NOTZONE
             return out_packet, None
 
@@ -375,7 +459,6 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
                     values = [v for v in values if v != upd.rdata_decoded]
                     if values: new_cache[key] = (ttl, values)
                     else: del new_cache[key]
-
         else:
             out_packet.header.flags.rcode = DNSRCode.FORMERR
             return out_packet, None
@@ -401,8 +484,9 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
         zone.records_cache = new_cache
         zone.save()
         threading.Thread(target=zone.notify_all_ns).start()
-        logging.info(f"update - [{zone.name}] +{len(additions)}/-{len(deletions)} RRs "
-              f"(serial {old_soa_serial} → {new_soa_serial})")
+        scope_label = f"micro-zone {micro_zone.name}" if micro_zone else zone.name
+        logging.info(f"update - [{scope_label}] +{len(additions)}/-{len(deletions)} RRs "
+                     f"(serial {old_soa_serial} → {new_soa_serial})")
 
     return out_packet, tsig_info
 
