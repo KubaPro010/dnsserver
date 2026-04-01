@@ -751,6 +751,8 @@ class PrimaryServer(DNSSocket):
                             EDNSOptionCode.COOKIE,
                             option.data + hmac.digest(EDNS_SECRET, option.data + client_ip, hashlib.md5)
                         ))
+                    elif option.code == EDNSOptionCode.NSID:
+                        edns_options.append(EDNSOption(EDNSOptionCode.NSID, threading.current_thread().name.encode()))
         out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
 
         if tsig_info is not None:
