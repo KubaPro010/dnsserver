@@ -5,12 +5,11 @@ import configparser, argparse
 import hmac, hashlib, random, base64
 from dataclasses import dataclass, field
 from lib.libcounter import Counter
-from server_base import DNSSocket, UDP, TCP, is_subdomain, _parse_soa_serial, query_dns
-import threading, time
+from server_base import DNSSocket, UDP, TCP, is_subdomain, _parse_soa_serial, query_dns, BUFFER_SIZE
+import threading, time, threading
+import copy
 
 logging.basicConfig(level=logging.INFO)
-
-BUFFER_SIZE = 1232
 
 EDNS_SECRET = random.randbytes(8)
 logging.debug("The EDNS secret for this run is", EDNS_SECRET)
@@ -22,14 +21,13 @@ parser.add_argument("config", type=str, default="config.ini")
 args = parser.parse_args()
 
 config = configparser.ConfigParser()
+logging.debug("Config:", args.config)
 config.read(args.config)
 
 HOST = config.get("server", "host", fallback="0.0.0.0")
 PORT = config.getint("server", "port", fallback=53)
 TCP_PORT = config.getint("server", "tcp_port", fallback=PORT)
 REQUESTS_PER_SECOND = config.getint("server", "rps", fallback=75)
-
-tsig_keys: dict[str, tuple[bytes, TSIGAlgorithm]] = {}
 
 @dataclass
 class JournalEntry:
@@ -38,22 +36,25 @@ class JournalEntry:
     additions: list[DNSAnswer]
     deletions: list[DNSAnswer]
 
+_lock = threading.RLock()
 soa_journal: dict[str, list[JournalEntry]] = {}
+tsig_keys: dict[str, tuple[bytes, TSIGAlgorithm]] = {}
 
 def get_journal_chain(zone_name: str, from_serial: int, to_serial: int) -> list[JournalEntry] | None:
     if from_serial == to_serial: return []
 
-    entries = soa_journal.get(zone_name, [])
-    entry_map: dict[int, JournalEntry] = {e.old_soa_serial: e for e in entries}
+    with _lock:
+        entries = soa_journal.get(zone_name, [])
+        entry_map: dict[int, JournalEntry] = {e.old_soa_serial: e for e in entries}
 
-    chain: list[JournalEntry] = []
-    current = from_serial
-    while current != to_serial:
-        entry = entry_map.get(current)
-        if entry is None: return None
-        chain.append(entry)
-        current = entry.new_soa_serial
-    return chain
+        chain: list[JournalEntry] = []
+        current = from_serial
+        while current != to_serial:
+            entry = entry_map.get(current)
+            if entry is None: return None
+            chain.append(entry)
+            current = entry.new_soa_serial
+        return chain
 
 @dataclass
 class MicroZone:
@@ -92,9 +93,9 @@ class Zone:
         for host in self.ns_list + self.allowed_axfr_hosts:
             try:
                 if socket.inet_aton(socket.gethostbyname(host)) == client_ip: return True
-            except OSError: pass            
+            except OSError: pass
         return False
-    
+
     def save(self):
         if not self.dyn_records_file: raise Exception
         dyn_records = {}
@@ -116,7 +117,6 @@ class Zone:
             for value in values:
                 lines.append(f"{DNSType(qtype).name}\t{name}\t{ttl}\t{value}\n")
 
-        # Write dynamic micro-zones ONLY (not static ones)
         for name, mz in getattr(self, "micro_zones", {}).items():
             if name not in getattr(self, "original_micro_zones", {}):
                 encoded = base64.b64encode(mz.key_secret).decode()
@@ -145,7 +145,7 @@ class Zone:
         ))
         for ns in self.ns_list[:]:
             if ns == primary_ns: continue
-            try: query_dns(packet, ns, BUFFER_SIZE)
+            try: query_dns(packet, ns)
             except Exception as e: logging.warning(f"Could not notify {ns} ({e})")
 
     def compute_soa_serial(self, serial: int | None = None):
@@ -306,12 +306,12 @@ class Zone:
                 deletions=deletions
             )
 
-            journal = soa_journal.setdefault(self.name, [])
-            journal.append(entry)
+            with _lock:
+                journal = soa_journal.setdefault(self.name, [])
+                journal.append(entry)
 
-            if len(journal) > MAX_JOURNAL_ENTRIES:
-                del journal[: len(journal) - MAX_JOURNAL_ENTRIES]
-        
+                if len(journal) > MAX_JOURNAL_ENTRIES: del journal[: len(journal) - MAX_JOURNAL_ENTRIES]
+
         self.records_cache = merged_records
         self.micro_zones = {**static_micro, **dyn_micro}
         self.records_mtime = (mtime, dyn_mtime)
@@ -335,67 +335,71 @@ class Zone:
             if result: return result, True
 
         return None, False
-    
+
 zones: list[Zone] = []
-micro_zones: dict[str, MicroZone] = field(default_factory=dict)
+micro_zones: dict[str, MicroZone] = {}
+ip_counts: dict[bytes, Counter] = {}
 
-for section in config.sections():
-    if section.startswith("zone:"):
-        zone_name = section[len("zone:"):].rstrip(".") + "."
-        sec = config[section]
-        primary_ns = sec["primary_ns"]
-        ns_list = [primary_ns] + [n for n in sec.get("ns", "").split(",") if n]
-        zones.append(Zone(
-            name=zone_name,
-            records_file=pathlib.Path(sec["file"]).resolve(),
-            primary_ns=primary_ns,
-            ns_list=ns_list,
-            soa_cfg={
-                "email": sec.get("email", "hostmaster." + zone_name),
-                "ttl": sec.getint("ttl", 300),
-                "refresh": sec.getint("refresh", 3600),
-                "retry": sec.getint("retry", 1800),
-                "expire": sec.getint("expire", 1209600),
-                "min": sec.getint("min", 3600),
-            },
-            serial=sec.getint("serial", 0),
-            update_tsig_keys=[k.strip() for k in sec.get("update_tsig_keys", "").split(",") if k.strip()],
-            axfr_tsig_keys=[k.strip() for k in sec.get("axfr_tsig_keys", "").split(",") if k.strip()],
-            allowed_axfr_hosts=[k.strip() for k in sec.get("allowed_axfr_hosts", "").split(",") if k.strip()],
-        ))
-    elif section.startswith("tsig:"):
-        key_name = section[len("tsig:"):]
-        sec = config[section]
-        secret = base64.b64decode(sec["secret"])
-        algorithm = TSIGAlgorithm(sec.get("algorithm", TSIGAlgorithm.HMAC_SHA256))
-        tsig_keys[key_name] = (secret, algorithm)
+with _lock:
+    for section in config.sections():
+        if section.startswith("zone:"):
+            zone_name = section[len("zone:"):].rstrip(".") + "."
+            sec = config[section]
+            primary_ns = sec["primary_ns"]
+            ns_list = [primary_ns] + [n for n in sec.get("ns", "").split(",") if n]
+            zones.append(Zone(
+                name=zone_name,
+                records_file=pathlib.Path(sec["file"]).resolve(),
+                primary_ns=primary_ns,
+                ns_list=ns_list,
+                soa_cfg={
+                    "email": sec.get("email", "hostmaster." + zone_name),
+                    "ttl": sec.getint("ttl", 300),
+                    "refresh": sec.getint("refresh", 3600),
+                    "retry": sec.getint("retry", 1800),
+                    "expire": sec.getint("expire", 1209600),
+                    "min": sec.getint("min", 3600),
+                },
+                serial=sec.getint("serial", 0),
+                update_tsig_keys=[k.strip() for k in sec.get("update_tsig_keys", "").split(",") if k.strip()],
+                axfr_tsig_keys=[k.strip() for k in sec.get("axfr_tsig_keys", "").split(",") if k.strip()],
+                allowed_axfr_hosts=[k.strip() for k in sec.get("allowed_axfr_hosts", "").split(",") if k.strip()],
+            ))
+        elif section.startswith("tsig:"):
+            key_name = section[len("tsig:"):]
+            sec = config[section]
+            secret = base64.b64decode(sec["secret"])
+            algorithm = TSIGAlgorithm(sec.get("algorithm", TSIGAlgorithm.HMAC_SHA256))
+            tsig_keys[key_name] = (secret, algorithm)
 
-if not zones: raise RuntimeError("No [zone:*] sections found in config")
+    if not zones: raise RuntimeError("No [zone:*] sections found in config")
 
 def find_zone(qname: str) -> Zone | None:
     best: Zone | None = None
     best_len = -1
-    for z in zones:
-        if is_subdomain(qname, z.name) and len(z.name) > best_len:
-            best = z
-            best_len = len(z.name)
-    return best
+    with _lock:
+        for z in zones:
+            if is_subdomain(qname, z.name) and len(z.name) > best_len:
+                best = z
+                best_len = len(z.name)
+        return best
 
 def load_all():
-    for z in zones:
-        try: z.load()
-        except Exception as e: logging.error(f"loading zone {z.name}: {e}")
+    with _lock:
+        for z in zones:
+            try: z.load()
+            except Exception as e: logging.error(f"loading zone {z.name}: {e}")
 
 last_ip_clear = 0
-ip_counts: dict[bytes, Counter] = {}
 
 def verify_request_tsig(packet: DNSPacket) -> tuple[TSIGRecord, bytes] | None:
     has_tsig = any(isinstance(rr, TSIGRecord) for rr in packet.additional)
     if not has_tsig: return None
-    keys_bytes = {name: secret for name, (secret, _) in tsig_keys.items()}
-    tsig_rec = packet.verify_tsig(keys_bytes)
-    secret, _ = tsig_keys[tsig_rec.key_name]
-    return tsig_rec, secret
+    with _lock:
+        keys_bytes = {name: secret for name, (secret, _) in tsig_keys.items()}
+        tsig_rec = packet.verify_tsig(keys_bytes)
+        secret, _ = tsig_keys[tsig_rec.key_name]
+        return tsig_rec, secret
 def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNSPacket, tuple[TSIGRecord, bytes] | None]:
     is_localhost = (client_ip == socket.inet_aton("127.0.0.1"))
 
@@ -537,13 +541,13 @@ def handle_update(packet: DNSPacket, out_packet: DNSPacket, client_ip: bytes, tr
             additions=additions,
             deletions=deletions,
         )
-        journal = soa_journal.setdefault(zone.name, [])
-        journal.append(entry)
-        if len(journal) > MAX_JOURNAL_ENTRIES:
-            del journal[:len(journal) - MAX_JOURNAL_ENTRIES]
+        with _lock:
+            journal = soa_journal.setdefault(zone.name, [])
+            journal.append(entry)
+            if len(journal) > MAX_JOURNAL_ENTRIES: del journal[:len(journal) - MAX_JOURNAL_ENTRIES]
 
-        zone.records_cache = new_cache
-        zone.save()
+            zone.records_cache = new_cache
+            zone.save()
         threading.Thread(target=zone.notify_all_ns).start()
         scope_label = f"micro-zone {micro_zone.name}" if micro_zone else zone.name
         logging.info(f"update - [{scope_label}] +{len(additions)}/-{len(deletions)} RRs "
@@ -558,17 +562,18 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
     ))
     tsig_info: tuple[TSIGRecord, bytes] | None = None
 
-    if (c := ip_counts.get(client_ip)):
-        c.beat()
-        if c.get_rate() > REQUESTS_PER_SECOND:
-            out.header.flags.rcode = DNSRCode.REFUSED
-            return out, tsig_info
-    else: ip_counts[client_ip] = Counter().beat()
+    with _lock:
+        if (c := ip_counts.get(client_ip)):
+            c.beat()
+            if c.get_rate() > REQUESTS_PER_SECOND:
+                out.header.flags.rcode = DNSRCode.REFUSED
+                return out, tsig_info
+        else: ip_counts[client_ip] = Counter().beat()
 
     if packet.header.flags.qr:
         out.header.flags.rcode = DNSRCode.REFUSED
         return out, tsig_info
-    if packet.header.flags.opcode == DNSOPCode.UPDATE: 
+    if packet.header.flags.opcode == DNSOPCode.UPDATE:
         try: return handle_update(packet, out, client_ip, transport)
         except ConnectionRefusedError:
             out.header.flags.rcode = DNSRCode.NOTIMP
@@ -613,7 +618,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
             case DNSType.NS:
                 if qask == zone.name:
                     for ns in zone.ns_list: out.add_answer(DNSAnswer(zone.name, DNSType.NS, DNSClass.IN, ns_ttl, rdata_decoded=ns))
-            case DNSType.AXFR: 
+            case DNSType.AXFR:
                 if transport != TCP:
                     out.header.flags.rcode = DNSRCode.REFUSED
                     continue
@@ -705,13 +710,13 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
                 if result:
                     ttl, values = result
                     for value in values: out.add_answer(DNSAnswer(question.qname, qtype_out, DNSClass.IN, ttl, rdata_decoded=value))
-                elif exists: 
+                elif exists:
                     out.header.flags.rcode = DNSRCode.NOERROR
                     soa(out.add_authoritive_rr)
                 else:
                     if qask != zone.name: out.header.flags.rcode = DNSRCode.NXDOMAIN
                     soa(out.add_authoritive_rr)
-    
+
     for aw in out.answers + out.authority:
         if aw.type not in (DNSType.CNAME, DNSType.NS, DNSType.MX): continue
         name = aw.rdata_decoded
@@ -731,7 +736,7 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum) -> tuple[DNS
 
 class PrimaryServer(DNSSocket):
     def _pre_run(self): load_all()
-    def handle(self, packet: DNSPacket, client_ip: bytes, transport: IntEnum, *args, **kwargs): 
+    def handle(self, packet: DNSPacket, client_ip: bytes, transport: IntEnum, *args, **kwargs):
         out, tsig_info = handle(packet, client_ip, transport, *args, **kwargs)
 
         max_size = BUFFER_SIZE
@@ -758,10 +763,11 @@ class PrimaryServer(DNSSocket):
             return bytes(out)[:max_size]
         return bout
     def _idle(self):
-        load_all()
-        global last_ip_clear
-        if (time.monotonic() - last_ip_clear) > 30:
-            to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
-            for ip in to_delete: del ip_counts[ip]
-            last_ip_clear = time.monotonic()
-PrimaryServer(HOST, PORT, TCP_PORT, BUFFER_SIZE).run()
+        with _lock:
+            load_all()
+            global last_ip_clear
+            if (time.monotonic() - last_ip_clear) > 30:
+                to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
+                for ip in to_delete: del ip_counts[ip]
+                last_ip_clear = time.monotonic()
+PrimaryServer(HOST, PORT, TCP_PORT, 32).run()

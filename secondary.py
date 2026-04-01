@@ -5,12 +5,11 @@ import hmac, hashlib
 import random
 from lib.libcounter import Counter
 import time
-from server_base import UDP, DNSSocket, is_subdomain, _parse_soa_serial
+from server_base import UDP, DNSSocket, is_subdomain, _parse_soa_serial, BUFFER_SIZE
 from server_base import query_dns as _query_dns
 from dataclasses import dataclass
 import threading
 
-BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
 
 parser = argparse.ArgumentParser()
@@ -23,8 +22,7 @@ parser.add_argument("-w", "--workers", type=int, default=8, help="Number of work
 parser.add_argument("--zone", action="append")
 args = parser.parse_args()
 
-def query_dns(packet: DNSPacket, *_args, **kwargs): 
-    return _query_dns(packet, args.primary, BUFFER_SIZE, *_args, **kwargs)
+def query_dns(packet: DNSPacket, *_args, **kwargs): return _query_dns(packet, args.primary, *_args, **kwargs)
 
 HOST = args.host
 PORT = args.port
@@ -306,4 +304,4 @@ class SecondaryServer(DNSSocket):
                         fetch_record(soa.zone)
                         soa.extra_time = 0
                     except Exception: soa.extra_time += soa.retry
-SecondaryServer(HOST, PORT, PORT, BUFFER_SIZE, args.workers).run()
+SecondaryServer(HOST, PORT, PORT, args.workers).run()

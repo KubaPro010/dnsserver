@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger("server")
 
+BUFFER_SIZE = 1232
+
 def is_subdomain(sub: str, parent: str) -> bool:
     sub = sub.rstrip('.').lower()
     parent = parent.rstrip('.').lower()
@@ -17,14 +19,14 @@ def _parse_soa_serial(rdata_decoded: str) -> int | None:
     if (d := params.get("serial")): return int(d)
     return None
 
-def query_dns(packet: DNSPacket, server_host: str, buffer_size: int, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
-    packet.add_additional_rr(EDNSOptRecord(False, buffer_size, []))
+def query_dns(packet: DNSPacket, server_host: str, port: int = 53, timeout: float = 2.0, force_tcp: bool = False) -> DNSPacket:
+    packet.add_additional_rr(EDNSOptRecord(False, BUFFER_SIZE, []))
     if not force_tcp:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp.settimeout(timeout)
         try:
             udp.sendto(bytes(packet), (server_host, port))
-            data, _ = udp.recvfrom(buffer_size)
+            data, _ = udp.recvfrom(BUFFER_SIZE)
             response = DNSPacket.from_bytes(data)
 
             if not response.header.flags.tc: return response
@@ -70,7 +72,7 @@ class DNSSocket:
             if not chunk: return None
             data += chunk
         return data
-    def __init__(self, host: str, port: int, tcp_port: int, buffer_size: int, workers: int = 1) -> None:
+    def __init__(self, host: str, port: int, tcp_port: int, workers: int = 1) -> None:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -86,7 +88,6 @@ class DNSSocket:
 
         self.tcp = tcp
         self.udp = udp
-        self.buffer_size = buffer_size
         self.workers = workers
     def handle(self, *args, **kwargs) -> bytes: return b""
     def run(self):
@@ -98,7 +99,7 @@ class DNSSocket:
                     readable, _, _ = select.select([udp, tcp], [], [], 1)
                     for sock in readable:
                         if sock is udp:
-                            data, addr = udp.recvfrom(self.buffer_size)
+                            data, addr = udp.recvfrom(BUFFER_SIZE)
                             if data: executor.submit(self._handle_udp, udp, data, addr)
                         elif sock is tcp:
                             conn, addr = tcp.accept()
