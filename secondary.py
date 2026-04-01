@@ -5,19 +5,21 @@ import hmac, hashlib
 import random
 from lib.libcounter import Counter
 import time
-from server_base import UDP, TCP, DNSSocket, is_subdomain, _parse_soa_serial
+from server_base import UDP, DNSSocket, is_subdomain, _parse_soa_serial
 from server_base import query_dns as _query_dns
 from dataclasses import dataclass
+import threading
 
 BUFFER_SIZE = 1232
 EDNS_SECRET = random.randbytes(8)
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-p", "--primary", type=str)
-parser.add_argument("-P", "--primaryport", type=int, default=53)
-parser.add_argument("-H", "--host", type=str, default="0.0.0.0")
-parser.add_argument("-t", "--port", type=int, default=53)
-parser.add_argument("-r", "--rps", type=int, default=75)
+parser.add_argument("-p", "--primary", type=str, help="Host IP/Address of the primary server")
+parser.add_argument("-P", "--primaryport", type=int, default=53, help="The port of the primary server")
+parser.add_argument("-H", "--host", type=str, default="0.0.0.0", help="IP Address to host our server at")
+parser.add_argument("-t", "--port", type=int, default=53, help="Port to host our server. Both UDP and TCP")
+parser.add_argument("-r", "--rps", type=int, default=75, help="Requests per second per IP")
+parser.add_argument("-w", "--workers", type=int, default=8, help="Number of workers allowed to serve at once")
 parser.add_argument("--zone", action="append")
 args = parser.parse_args()
 
@@ -39,14 +41,16 @@ class SOAData:
     age: int
     extra_time: int = 0
 
+_lock = threading.RLock()
 soas: dict[str, SOAData] = {}
-
 records: dict[str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]] = {}
+to_fetch: list[tuple[DNSAnswer | None, str]] = []
+last_ip_clear = 0
+ip_counts: dict[bytes, Counter] = {}
 
 def parse_axfr(packet: DNSPacket, zone: str):
-    def delete_zone(zone): records.pop(zone, None)
     data_age = time.monotonic()
-    delete_zone(zone)
+    with _lock: records.pop(zone, None)
 
     if not packet.answers or packet.answers[0].type != DNSType.SOA or packet.answers[-1].type != DNSType.SOA: raise Exception("Invalid AXFR: missing SOA boundaries")
 
@@ -57,9 +61,9 @@ def parse_axfr(packet: DNSPacket, zone: str):
                 tokens = anwser.rdata_decoded.split()
                 params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
 
-                soas[anwser.name] = SOAData(anwser, anwser.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
+                with _lock: soas[anwser.name] = SOAData(anwser, anwser.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
             case _: out.setdefault(anwser.name, []).append(anwser)
-    records[zone] = (packet.answers, out)
+    with _lock: records[zone] = (packet.answers, out)
 
 def parse_ixfr(packet: DNSPacket, zone: str):
     data_age = time.monotonic()
@@ -75,9 +79,9 @@ def parse_ixfr(packet: DNSPacket, zone: str):
     tokens = new_soa.rdata_decoded.split()
     params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
 
-    soas[new_soa.name] = SOAData(new_soa, new_soa.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
-
-    raw_records, out = records[zone]
+    with _lock: 
+        soas[new_soa.name] = SOAData(new_soa, new_soa.name, int(params["serial"]), int(params["refresh"]), int(params["retry"]), int(params["expire"]), int(data_age))
+        raw_records, out = records[zone]
 
     adding = True
     for anwser in packet.answers[1:]:
@@ -93,35 +97,37 @@ def parse_ixfr(packet: DNSPacket, zone: str):
                     out[anwser.name] = x
 
                     raw_records[:] = [rc for rc in raw_records if bytes(rc) != bytes(anwser)]
-    records[zone] = (raw_records, out)
+    with _lock: records[zone] = (raw_records, out)
 
 def fetch_record(zone: str, soa_record: DNSAnswer | None = None):
     def generate_packet(): return DNSPacket(DNSHeader(random.randint(0, 0xffff), DNSHeader_Flags(False, DNSOPCode.QUERY, False, False, False, False, False, False, DNSRCode.NOERROR)))
 
-    if soas.get(zone) and not soa_record:
-        soa_packet = generate_packet()
-        soa_packet.add_question(DNSQuestion(zone, DNSType.SOA, DNSClass.IN))
-        soa_res = query_dns(soa_packet)
-        for aw in soa_res.answers:
-            if aw.type != DNSType.SOA: continue
-            tokens = aw.rdata_decoded.split()
+    with _lock:
+        if soas.get(zone) and not soa_record:
+            soa_packet = generate_packet()
+            soa_packet.add_question(DNSQuestion(zone, DNSType.SOA, DNSClass.IN))
+            soa_res = query_dns(soa_packet)
+            for aw in soa_res.answers:
+                if aw.type != DNSType.SOA: continue
+                tokens = aw.rdata_decoded.split()
+                params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
+                if soas[zone].serial == int(params["serial"]): return # We have the same serial
+        elif soas.get(zone) and soa_record:
+            tokens = soa_record.rdata_decoded.split()
             params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
             if soas[zone].serial == int(params["serial"]): return # We have the same serial
-    elif soas.get(zone) and soa_record:
-        tokens = soa_record.rdata_decoded.split()
-        params = {k: int(v) for k, v in (t.split("=") for t in tokens[2:])}
-        if soas[zone].serial == int(params["serial"]): return # We have the same serial
     print("Updating records for", zone)
     
     packet = generate_packet()
 
     parse_method = parse_axfr
-    if (s := soas.get(zone)):
-        packet.add_question(DNSQuestion(zone, DNSType.IXFR, DNSClass.IN))
-        packet.add_authoritive_rr(s.record)
-        parse_method = parse_ixfr
-        print("IFXR sent, serial:", s.serial)
-    else: packet.add_question(DNSQuestion(zone, DNSType.AXFR, DNSClass.IN))
+    with _lock:
+        if (s := soas.get(zone)):
+            packet.add_question(DNSQuestion(zone, DNSType.IXFR, DNSClass.IN))
+            packet.add_authoritive_rr(s.record)
+            parse_method = parse_ixfr
+            print("IFXR sent, serial:", s.serial)
+        else: packet.add_question(DNSQuestion(zone, DNSType.AXFR, DNSClass.IN))
     res = query_dns(packet, force_tcp=True)
     if res.header.flags.rcode != DNSRCode.NOERROR: raise Exception(res.header.flags.rcode.name)
     parse_method(res, zone)
@@ -138,21 +144,17 @@ def find_wildcard(qname: str, zone: str, zone_records: dict[str, list[DNSAnswer]
         if candidate in zone_records: return zone_records[candidate]
     return []
 
-to_fetch: list[tuple[DNSAnswer | None, str]] = []
-
-last_ip_clear = 0
-ip_counts: dict[bytes, Counter] = {}
-
 def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
     out = DNSPacket(DNSHeader(
         packet.header.transaction_id, DNSHeader_Flags(True, DNSOPCode.QUERY, True, False, True, False, False, False, DNSRCode.NOERROR)))
 
-    if (c := ip_counts.get(client_ip)):
-        c.beat()
-        if c.get_rate() > REQUESTS_PER_SECOND:
-            out.header.flags.rcode = DNSRCode.REFUSED
-            return bytes(out)
-    else: ip_counts[client_ip] = Counter()
+    if _lock:
+        if (c := ip_counts.get(client_ip)):
+            c.beat()
+            if c.get_rate() > REQUESTS_PER_SECOND:
+                out.header.flags.rcode = DNSRCode.REFUSED
+                return bytes(out)
+        else: ip_counts[client_ip] = Counter()
 
     if packet.header.flags.qr:
         out.header.flags.rcode = DNSRCode.REFUSED
@@ -165,9 +167,10 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
             if aw.type == DNSType.SOA:
                 soa_record = aw
                 break
-        if zone in soas and client_ip == socket.inet_aton(socket.gethostbyname(args.primary)):
-            print(f"Got notifed of change ({zone})")
-            to_fetch.append((soa_record, zone))
+        with _lock:
+            if zone in soas and client_ip == socket.inet_aton(socket.gethostbyname(args.primary)):
+                print(f"Got notifed of change ({zone})")
+                to_fetch.append((soa_record, zone))
         packet.header.flags.qr = True
         return bytes(packet)
     elif packet.header.flags.opcode == DNSOPCode.UPDATE:
@@ -186,16 +189,17 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
         found_name = False
         this_zone = None
         best_len = -1
-        for zone in records.keys():
-            if is_subdomain(question.qname, zone) and len(zone) > best_len:
-                this_zone = zone
-                best_len = len(zone)
-        if not this_zone:
-            out.header.flags.rcode = DNSRCode.NOTZONE
-            return bytes(out)
-        soa = soas[this_zone]
-        soas_here.append(soa.record)
-        _, zone_records = records[this_zone]
+        with _lock:
+            for zone in records.keys():
+                if is_subdomain(question.qname, zone) and len(zone) > best_len:
+                    this_zone = zone
+                    best_len = len(zone)
+            if not this_zone:
+                out.header.flags.rcode = DNSRCode.NOTZONE
+                return bytes(out)
+            soa = soas[this_zone]
+            soas_here.append(soa.record)
+            _, zone_records = records[this_zone]
 
         if time.monotonic() >= (soa.age + soa.expire):
             out.header.flags.rcode = DNSRCode.SERVFAIL
@@ -246,12 +250,13 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
 
         this_zone = None
         best_len = -1
-        for zone in records.keys():
-            if is_subdomain(name, zone) and len(zone) > best_len:
-                this_zone = zone
-                best_len = len(zone)
-        if not this_zone: continue
-        _, zone_records = records[this_zone]
+        with _lock:
+            for zone in records.keys():
+                if is_subdomain(name, zone) and len(zone) > best_len:
+                    this_zone = zone
+                    best_len = len(zone)
+            if not this_zone: continue
+            _, zone_records = records[this_zone]
 
         # str, tuple[list[DNSAnswer], dict[str, list[DNSAnswer]]]
         for record in zone_records.get(name, []):
@@ -268,6 +273,8 @@ def handle(packet: DNSPacket, client_ip: bytes, transport: IntEnum):
                 match option.code:
                     case EDNSOptionCode.COOKIE:
                         edns_options.append(EDNSOption(EDNSOptionCode.COOKIE, option.data + hmac.digest(EDNS_SECRET, option.data + client_ip, hashlib.md5)))
+                    case EDNSOptionCode.NSID:
+                        edns_options.append(EDNSOption(EDNSOptionCode.NSID, threading.current_thread().name.encode()))
     out.add_additional_rr(EDNSOptRecord(False, max_size, edns_options))
 
     bout = bytes(out)
@@ -281,21 +288,22 @@ class SecondaryServer(DNSSocket):
     def _pre_run(self): 
         fetch_records()
     def _idle(self):
-        global last_ip_clear
-        if (time.monotonic() - last_ip_clear) > 30:
-            to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
-            for ip in to_delete: del ip_counts[ip]
-            last_ip_clear = time.monotonic()
+        with _lock:
+            global last_ip_clear
+            if (time.monotonic() - last_ip_clear) > 30:
+                to_delete = [ip for ip, counter in ip_counts.items() if counter.get_rate() < (REQUESTS_PER_SECOND / 2)]
+                for ip in to_delete: del ip_counts[ip]
+                last_ip_clear = time.monotonic()
         
-        for soa_record, zone in to_fetch:
-            try: fetch_record(zone, soa_record)
-            except Exception: pass
-        to_fetch.clear()
+            for soa_record, zone in to_fetch:
+                try: fetch_record(zone, soa_record)
+                except Exception: pass
+            to_fetch.clear()
 
-        for soa in soas.values():
-            if time.monotonic() >= soa.age + soa.refresh + soa.extra_time:
-                try:
-                    fetch_record(soa.zone)
-                    soa.extra_time = 0
-                except Exception: soa.extra_time += soa.retry
-SecondaryServer(HOST, PORT, PORT, BUFFER_SIZE).run()
+            for soa in soas.values():
+                if time.monotonic() >= soa.age + soa.refresh + soa.extra_time:
+                    try:
+                        fetch_record(soa.zone)
+                        soa.extra_time = 0
+                    except Exception: soa.extra_time += soa.retry
+SecondaryServer(HOST, PORT, PORT, BUFFER_SIZE, args.workers).run()

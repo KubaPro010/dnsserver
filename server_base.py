@@ -2,6 +2,7 @@ import traceback, socket, select, struct
 from enum import IntEnum
 from protocol.frame import DNSPacket, EDNSOptRecord
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger("server")
 
@@ -69,7 +70,7 @@ class DNSSocket:
             if not chunk: return None
             data += chunk
         return data
-    def __init__(self, host: str, port: int, tcp_port: int, buffer_size: int) -> None:
+    def __init__(self, host: str, port: int, tcp_port: int, buffer_size: int, workers: int = 1) -> None:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -80,29 +81,42 @@ class DNSSocket:
         tcp.bind((host, tcp_port))
         logger.info(f"UDP listening on {host}:{port}")
 
-        tcp.listen(32)
+        tcp.listen(min(24, workers * 2))
         logger.info(f"TCP listening on {host}:{tcp_port}")
 
         self.tcp = tcp
         self.udp = udp
         self.buffer_size = buffer_size
+        self.workers = workers
     def handle(self, *args, **kwargs) -> bytes: return b""
     def run(self):
-        with self.udp as udp, self.tcp as tcp:
+        executor = ThreadPoolExecutor(max_workers=self.workers)
+        with self.udp as udp, self.tcp as tcp, executor:
             self._pre_run()
             while True:
                 try:
-                    readable, _, _ = select.select([udp, tcp], [], [], 2)
+                    readable, _, _ = select.select([udp, tcp], [], [], 1)
                     for sock in readable:
                         if sock is udp:
                             data, addr = udp.recvfrom(self.buffer_size)
-                            if data: udp.sendto(self.handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), UDP), addr)
+                            if data: executor.submit(self._handle_udp, udp, data, addr)
                         elif sock is tcp:
                             conn, addr = tcp.accept()
-                            with conn:
-                                data = self._recv_tcp(conn)
-                                if data:
-                                    out = self.handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), TCP)
-                                    conn.sendall(struct.pack("!H", len(out)) + out)
+                            executor.submit(self._handle_tcp, conn, addr)
                     if not readable: self._idle()
                 except Exception as e: traceback.print_exception(e)
+
+    def _handle_udp(self, udp, data, addr):
+        try:
+            response = self.handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), UDP)
+            udp.sendto(response, addr)
+        except Exception as e: traceback.print_exception(e)
+
+    def _handle_tcp(self, conn, addr):
+        with conn:
+            try:
+                data = self._recv_tcp(conn)
+                if data:
+                    out = self.handle(DNSPacket.from_bytes(data), socket.inet_aton(addr[0]), TCP)
+                    conn.sendall(struct.pack("!H", len(out)) + out)
+            except Exception as e: traceback.print_exception(e)
